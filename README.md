@@ -37,6 +37,7 @@ Optional configuration keys:
 - **Log output:** `log_file` (local) and/or `[loom]` (remote). See [Log output](#log-output) below.
 - `read_timeout_seconds` / `write_timeout_seconds` — connection timeouts
 - `rate_limit_per_second` / `rate_limit_burst` — connection rate-limiting
+- `community_id_seed` — optional 16-bit seed for Community ID v1 flow hashing (omit or `0` for default)
 
 If these runtime tuning fields are omitted or set to `0`, Spip applies the following defaults:
 - `read_timeout_seconds`: 30
@@ -80,6 +81,7 @@ Spip emits each connection as a single JSON object. The output is formatted to b
 - `user_agent.original` — when available
 - `event.summary` — raw payload for non-HTTP probes
 - `event.original_payload_hex` — raw payload hex (always preserved)
+- [Fingerprinting](#fingerprinting) (built-in) adds `network.community_id`, `tls.client.*`, `http.request.hash.http_fp`, `ssh.client.hash.hassh` when applicable.
 
 Example (ECS-shaped) record produced by Spip:
 ```json
@@ -101,6 +103,23 @@ Example (ECS-shaped) record produced by Spip:
 
 Note: the agent only emits fields it can derive from the connection payload and metadata. Downstream systems can enrich these records (geo, ASN, etc.) if desired.
 
+## Fingerprinting
+
+Spip can add passive fingerprinting fields to each connection record (ECS-compatible, no change to payload capture):
+
+- **Community ID** (`network.community_id`) — v1 flow hash of the 5-tuple (source/dest IP and port, protocol). When traffic is redirected via iptables, Spip uses the **original destination** (before REDIRECT) so the hash matches what other tools (e.g. Zeek, Suricata) would compute for the same flow.
+- **TLS** — From the ClientHello: `tls.client.server_name` (SNI), `tls.client.supported_protocols` (ALPN list), `tls.client.hash.ja4` (JA4 fingerprint).
+- **HTTP** — From the first request: `http.request.hash.http_fp` (HTTP request fingerprint).
+- **SSH** — When the payload starts with `SSH-2.0-` and contains a KEXINIT: `ssh.client.hash.hassh` (Hassh).
+
+All of these are additive; existing behaviour (local log, Loom, payload hex, HTTP parsing) is unchanged.
+
+**References (for verification and attribution):**  
+Community ID: [Corelight Community ID spec](https://github.com/corelight/community-id-spec).  
+JA4: [FoxIO JA4](https://github.com/FoxIO-LLC/ja4).  
+Hassh: [Salesforce HASSH](https://github.com/salesforce/hassh).  
+TLS fingerprinting uses [github.com/psanford/tlsfingerprint](https://github.com/psanford/tlsfingerprint) (MIT).
+
 ## Loom (optional log shipping)
 
 Part of [log output](#log-output): when `[loom]` has `enabled = true`, the same ECS records are also batched and POSTed to your Loom ingest URL. Required when enabled: `url`, `sensor_id`, `token`. Optional: `batch_size` (default 50), `flush_interval` (e.g. `"10s"`), `insecure_skip_verify` (for self-signed Loom certs). The exporter runs asynchronously and does not block the capture loop; failed POSTs are logged to stderr and the batch is dropped (fail-open).
@@ -109,7 +128,7 @@ Part of [log output](#log-output): when `[loom]` has `enabled = true`, the same 
 ```
 .
 ├── cmd/                 # Main application entry point
-├── internal/            # Configuration, logging, network, TLS, exporters (e.g. Loom)
+├── internal/            # Config, logging, network, TLS, fingerprinting, exporters (e.g. Loom)
 ├── pkg/                 # cgo helpers (socket operations)
 ├── test/                # End-to-end test helpers
 └── scripts/             # Utility scripts (including `initial_setup.sh`)
@@ -121,7 +140,7 @@ Run unit tests with:
 go test ./...
 ```
 
-End-to-end tests require privileges to manipulate `iptables` and are runnable via the included container helper scripts (see `scripts/`).
+End-to-end tests require privileges to manipulate `iptables` and are runnable via the included container helper scripts (see `scripts/`). They validate core behaviour (payload capture, source/destination, TLS detection, Loom batching). New fingerprint fields are additive and do not change what the e2e tests assert; if you run e2e in an environment without iptables or with different redirect rules, some tests may be skipped or fail as before.
 
 ## Notes on HTTP parsing and deployment
 

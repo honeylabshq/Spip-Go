@@ -3,6 +3,7 @@ package logging
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"testing"
 	"time"
@@ -199,6 +200,148 @@ func TestLogConnection(t *testing.T) {
 		if hn, _ := obs["hostname"].(string); hn == "" {
 			t.Errorf("observer.hostname is empty, expected value")
 		}
+	}
+}
+
+// TestLogConnection_Fingerprinting verifies that when ConnectionData has fingerprint fields set,
+// the ECS output contains network.community_id, tls.client.*, http.request.hash.http_fp, ssh.client.hash.hassh.
+func TestLogConnection_Fingerprinting(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "spip-fp-test")
+	if err != nil {
+		t.Fatalf("create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	logger := NewLogger(tmpFile)
+	connData := &ConnectionData{
+		Timestamp:             time.Now().Unix(),
+		Payload:               "GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+		PayloadHex:            "474554202f20485454502f312e310d0a486f73743a20780d0a0d0a",
+		SourceIP:              "10.0.0.1",
+		SourcePort:            40000,
+		DestinationIP:         "10.0.0.2",
+		DestinationPort:       443,
+		SessionID:             "fp-session",
+		IsTLS:                 true,
+		TLSServerName:         "example.com",
+		TLSALPN:               "h2",
+		CommunityID:           "1:abc123",
+		TLSSupportedProtocols: []string{"h2", "http/1.1"},
+		TLSJA4:                "t13d1516h2_8daaf6152771_e5627efa2ab1",
+		HTTPFP:              "ge11n00100_53b50f4ec784",
+		SSHHassh:              "92674389fa1e47a27ddd8d9b63ecd42b",
+	}
+
+	if err := logger.LogConnection(connData); err != nil {
+		t.Fatalf("LogConnection: %v", err)
+	}
+	if _, err := tmpFile.Seek(0, 0); err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+
+	var logged map[string]interface{}
+	if err := json.NewDecoder(tmpFile).Decode(&logged); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// network.community_id
+	if netObj, ok := logged["network"].(map[string]interface{}); ok {
+		if cid, _ := netObj["community_id"].(string); cid != connData.CommunityID {
+			t.Errorf("network.community_id = %q, want %q", cid, connData.CommunityID)
+		}
+	} else {
+		t.Fatal("missing network object")
+	}
+
+	// tls.client.server_name, tls.client.supported_protocols, tls.client.hash.ja4
+	if tlsObj, ok := logged["tls"].(map[string]interface{}); ok {
+		client, _ := tlsObj["client"].(map[string]interface{})
+		if client == nil {
+			t.Fatal("missing tls.client")
+		}
+		if sn, _ := client["server_name"].(string); sn != connData.TLSServerName {
+			t.Errorf("tls.client.server_name = %q, want %q", sn, connData.TLSServerName)
+		}
+		if protos, ok := client["supported_protocols"].([]interface{}); ok {
+			if len(protos) != len(connData.TLSSupportedProtocols) {
+				t.Errorf("tls.client.supported_protocols len = %d, want %d", len(protos), len(connData.TLSSupportedProtocols))
+			}
+		}
+		if hash, ok := client["hash"].(map[string]interface{}); ok {
+			if ja4, _ := hash["ja4"].(string); ja4 != connData.TLSJA4 {
+				t.Errorf("tls.client.hash.ja4 = %q, want %q", ja4, connData.TLSJA4)
+			}
+		} else {
+			t.Error("missing tls.client.hash")
+		}
+	} else {
+		t.Fatal("missing tls object")
+	}
+
+	// http.request.hash.http_fp is computed from payload in logger (not from ConnectionData); just assert it appears for HTTP-like payload
+	if httpObj, ok := logged["http"].(map[string]interface{}); ok {
+		if req, ok := httpObj["request"].(map[string]interface{}); ok {
+			if hash, ok := req["hash"].(map[string]interface{}); ok {
+				if http_fp, _ := hash["http_fp"].(string); http_fp == "" {
+					t.Error("http.request.hash.http_fp should be set for HTTP-like payload")
+				}
+			}
+		}
+	}
+
+	// ssh.client.hash.hassh
+	if sshObj, ok := logged["ssh"].(map[string]interface{}); ok {
+		client, _ := sshObj["client"].(map[string]interface{})
+		if client == nil {
+			t.Fatal("missing ssh.client")
+		}
+		if hash, ok := client["hash"].(map[string]interface{}); ok {
+			if hassh, _ := hash["hassh"].(string); hassh != connData.SSHHassh {
+				t.Errorf("ssh.client.hash.hassh = %q, want %q", hassh, connData.SSHHassh)
+			}
+		} else {
+			t.Error("missing ssh.client.hash")
+		}
+	} else {
+		t.Fatal("missing ssh object")
+	}
+}
+
+// TestLogConnection_LoomReceivesSameECS verifies that when ecsChan is set (Loom path), the same ECS record is sent.
+func TestLogConnection_LoomReceivesSameECS(t *testing.T) {
+	ecsChan := make(chan map[string]interface{}, 1)
+	logger := NewLoggerWithECSChannel(io.Discard, ecsChan)
+
+	connData := &ConnectionData{
+		Timestamp:       time.Now().Unix(),
+		Payload:         "test",
+		PayloadHex:      "74657374",
+		SourceIP:        "127.0.0.1",
+		SourcePort:      1,
+		DestinationIP:   "192.168.1.1",
+		DestinationPort: 80,
+		SessionID:       "loom-session",
+		IsTLS:           false,
+		CommunityID:     "1:xyz",
+	}
+
+	if err := logger.LogConnection(connData); err != nil {
+		t.Fatalf("LogConnection: %v", err)
+	}
+
+	select {
+	case m := <-ecsChan:
+		if m["event"] == nil || m["source"] == nil || m["destination"] == nil || m["network"] == nil {
+			t.Errorf("Loom received ECS missing core keys: %v", m)
+		}
+		if netObj, ok := m["network"].(map[string]interface{}); ok {
+			if cid, _ := netObj["community_id"].(string); cid != connData.CommunityID {
+				t.Errorf("Loom network.community_id = %q, want %q", cid, connData.CommunityID)
+			}
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Loom ecsChan did not receive record")
 	}
 }
 

@@ -99,8 +99,8 @@ func main() {
 		writeTimeout = 10 * time.Second
 	}
 
-	// Create network handler
-	handler := network.NewHandler(logger, tlsHandler, ratePerSec, burst, readTimeout, writeTimeout, cfg.Name)
+	// Create network handler (community_id_seed from config, 0 = default)
+	handler := network.NewHandler(logger, tlsHandler, ratePerSec, burst, readTimeout, writeTimeout, cfg.Name, cfg.CommunityIDSeed)
 
 	// Create TCP listener
 	addr := fmt.Sprintf("%s:%d", cfg.IP, cfg.Port)

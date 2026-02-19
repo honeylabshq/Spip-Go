@@ -11,21 +11,28 @@ import (
 
 // LogEntry represents the JSON log format output by the SPIP agent
 type LogEntry struct {
-	Timestamp       int64  `json:"timestamp"`
-	Level           string `json:"level,omitempty"`
-	Message         string `json:"message,omitempty"`
-	Target          string `json:"target,omitempty"`
-	RecordType      string `json:"record_type,omitempty"`
-	Payload         string `json:"payload,omitempty"`
-	PayloadHex      string `json:"payload_hex,omitempty"`
-	SourceIP        string `json:"source_ip,omitempty"`
-	SourcePort      int    `json:"source_port,omitempty"`
-	DestinationIP   string `json:"destination_ip,omitempty"`
-	DestinationPort int    `json:"destination_port,omitempty"`
-	SessionID       string `json:"session_id,omitempty"`
-	IsTLS           bool   `json:"is_tls,omitempty"`
-	TLSVersion      string `json:"tls_version,omitempty"`
-	TLSCipherSuite  string `json:"tls_cipher_suite,omitempty"`
+	Timestamp       int64    `json:"timestamp"`
+	Level           string   `json:"level,omitempty"`
+	Message         string   `json:"message,omitempty"`
+	Target          string   `json:"target,omitempty"`
+	RecordType      string   `json:"record_type,omitempty"`
+	Payload         string   `json:"payload,omitempty"`
+	PayloadHex      string   `json:"payload_hex,omitempty"`
+	SourceIP        string   `json:"source_ip,omitempty"`
+	SourcePort      int      `json:"source_port,omitempty"`
+	DestinationIP   string   `json:"destination_ip,omitempty"`
+	DestinationPort int      `json:"destination_port,omitempty"`
+	SessionID       string   `json:"session_id,omitempty"`
+	IsTLS           bool     `json:"is_tls,omitempty"`
+	TLSVersion      string   `json:"tls_version,omitempty"`
+	TLSCipherSuite  string   `json:"tls_cipher_suite,omitempty"`
+	// Fingerprinting (ECS)
+	CommunityID           string   `json:"community_id,omitempty"`
+	TLSServerName         string   `json:"tls_server_name,omitempty"`
+	TLSSupportedProtocols []string `json:"tls_supported_protocols,omitempty"`
+	TLSJA4                string   `json:"tls_ja4,omitempty"`
+	HTTPFP              string   `json:"http_fp,omitempty"`
+	SSHHassh              string   `json:"ssh_hassh,omitempty"`
 }
 
 // ValidateLogEntry validates a single log entry against expected values
@@ -167,11 +174,57 @@ func ParseLogLine(line string) (*LogEntry, error) {
 		}
 	}
 
-	// network.protocol -> IsTLS
+	// network.protocol -> IsTLS, network.community_id
 	if netObj, ok := m["network"].(map[string]interface{}); ok {
 		if proto, ok := netObj["protocol"].(string); ok {
 			if proto == "tls" || proto == "https" {
 				entry.IsTLS = true
+			}
+		}
+		if cid, ok := netObj["community_id"].(string); ok {
+			entry.CommunityID = cid
+		}
+	}
+
+	// tls.client.server_name, tls.client.supported_protocols, tls.client.hash.ja4
+	if tlsObj, ok := m["tls"].(map[string]interface{}); ok {
+		if client, ok := tlsObj["client"].(map[string]interface{}); ok {
+			if sn, ok := client["server_name"].(string); ok {
+				entry.TLSServerName = sn
+			}
+			if ja4, ok := client["hash"].(map[string]interface{}); ok {
+				if s, ok := ja4["ja4"].(string); ok {
+					entry.TLSJA4 = s
+				}
+			}
+			if protos, ok := client["supported_protocols"].([]interface{}); ok {
+				for _, p := range protos {
+					if s, ok := p.(string); ok {
+						entry.TLSSupportedProtocols = append(entry.TLSSupportedProtocols, s)
+					}
+				}
+			}
+		}
+	}
+
+	// http.request.hash.http_fp
+	if httpObj, ok := m["http"].(map[string]interface{}); ok {
+		if req, ok := httpObj["request"].(map[string]interface{}); ok {
+			if hash, ok := req["hash"].(map[string]interface{}); ok {
+				if http_fp, ok := hash["http_fp"].(string); ok {
+					entry.HTTPFP = http_fp
+				}
+			}
+		}
+	}
+
+	// ssh.client.hash.hassh
+	if sshObj, ok := m["ssh"].(map[string]interface{}); ok {
+		if client, ok := sshObj["client"].(map[string]interface{}); ok {
+			if hash, ok := client["hash"].(map[string]interface{}); ok {
+				if hassh, ok := hash["hassh"].(string); ok {
+					entry.SSHHassh = hassh
+				}
 			}
 		}
 	}

@@ -2,5 +2,7 @@ github.com/BurntSushi/toml v1.5.0 h1:W5quZX/G/csjUnuI8SUYlsHs9M38FC7znL0lIO+DvMg
 github.com/BurntSushi/toml v1.5.0/go.mod h1:ukJfTF/6rtPPRCnwkur4qwRxa8vTRFBF0uk2lLoLwho=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+github.com/psanford/tlsfingerprint v0.0.0-20251111180026-c742e470de9b h1:fsP7F1zLHZ4ozxhesg4j8qSsaJxK7Ev9fA2cUtbThec=
+github.com/psanford/tlsfingerprint v0.0.0-20251111180026-c742e470de9b/go.mod h1:F7HlBxc/I5XX6syuwpDtffw/6J+d0Q2xcUhYSbx/0Uw=
 golang.org/x/time v0.11.0 h1:/bpjEDfN9tkoN/ryeYHnv5hcMlc8ncjMcM4XBk5NWV0=
 golang.org/x/time v0.11.0/go.mod h1:CDIdPxbZBQxdj6cxyCIdrNogrJKMJ7pr37NYpMcMDSg=
