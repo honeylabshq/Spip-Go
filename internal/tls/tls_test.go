@@ -160,7 +160,7 @@ func TestTLSStream(t *testing.T) {
 		defer conn.Close()
 
 		// Wrap server connection with TLS
-		tlsConn, isTLS, err := handler.WrapConnection(conn)
+		tlsConn, isTLS, err := handler.WrapConnection(conn, nil)
 		if err != nil {
 			t.Errorf("Failed to wrap connection: %v", err)
 			return

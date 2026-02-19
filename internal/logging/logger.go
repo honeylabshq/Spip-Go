@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"spip/internal/fingerprint"
 )
 
 // LogLevel represents the severity of a log message
@@ -50,6 +52,13 @@ type ConnectionData struct {
 	TLSClientIssuer    string `json:"tls_client_issuer,omitempty"`
 	TLSClientNotBefore int64  `json:"tls_client_not_before,omitempty"`
 	TLSClientNotAfter  int64  `json:"tls_client_not_after,omitempty"`
+
+	// Fingerprinting (ECS)
+	CommunityID           string   `json:"community_id,omitempty"`            // network.community_id
+	TLSSupportedProtocols []string `json:"tls_supported_protocols,omitempty"`   // tls.client.supported_protocols (ALPN list from ClientHello)
+	TLSJA4                string   `json:"tls_ja4,omitempty"`                 // tls.client.hash.ja4
+	HTTPFP              string   `json:"http_fp,omitempty"`               // http.request.hash.http_fp
+	SSHHassh              string   `json:"ssh_hassh,omitempty"`               // ssh.client.hash.hassh
 }
 
 // Logger defines the interface for logging operations
@@ -67,7 +76,7 @@ type FileLogger struct {
 	ecsChan chan<- map[string]interface{}
 }
 
-var httpReqLineRe = regexp.MustCompile(`^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+(\S+)\s+HTTP/1\.[01]$`)
+var httpReqLineRe = regexp.MustCompile(`^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+(\S+)\s+(HTTP/1\.[01])$`)
 
 func NewLogger(output io.Writer) Logger {
 	return &FileLogger{output: output}
@@ -119,29 +128,34 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 		ecs["host"] = map[string]interface{}{"name": data.Name}                          // host.name
 	}
 
-	// network transport/protocol hints (derived from IsTLS)
+	// network transport/protocol hints (derived from IsTLS) + Community ID
 	network := map[string]interface{}{"transport": "tcp"}
+	if data.CommunityID != "" {
+		network["community_id"] = data.CommunityID
+	}
 	if data.IsTLS {
 		network["protocol"] = "tls"
 	}
 	ecs["network"] = network
 
-	// Include TLS metadata if available
+	// ECS tls.client.* (server_name, supported_protocols, hash.ja4) + legacy fields
 	if data.IsTLS {
-		tlsObj := map[string]interface{}{}
+		tlsClient := map[string]interface{}{}
 		if data.TLSServerName != "" {
-			tlsObj["server_name"] = data.TLSServerName
+			tlsClient["server_name"] = data.TLSServerName
 		}
-		if data.TLSALPN != "" {
-			tlsObj["alpn"] = data.TLSALPN
+		if len(data.TLSSupportedProtocols) > 0 {
+			tlsClient["supported_protocols"] = data.TLSSupportedProtocols
+		}
+		if data.TLSJA4 != "" {
+			tlsClient["hash"] = map[string]interface{}{"ja4": data.TLSJA4}
 		}
 		if data.TLSVersion != "" {
-			tlsObj["version"] = data.TLSVersion
+			tlsClient["version"] = data.TLSVersion
 		}
 		if data.TLSCipherSuite != "" {
-			tlsObj["cipher"] = data.TLSCipherSuite
+			tlsClient["cipher"] = data.TLSCipherSuite
 		}
-		// Optional client certificate details when mTLS is used
 		clientCert := map[string]interface{}{}
 		if data.TLSClientSubject != "" {
 			clientCert["subject"] = data.TLSClientSubject
@@ -156,9 +170,13 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 			clientCert["not_after"] = time.Unix(data.TLSClientNotAfter, 0).UTC().Format(time.RFC3339Nano)
 		}
 		if len(clientCert) > 0 {
-			tlsObj["client_certificate"] = clientCert
+			tlsClient["client_certificate"] = clientCert
 		}
-		if len(tlsObj) > 0 {
+		if len(tlsClient) > 0 {
+			tlsObj := map[string]interface{}{"client": tlsClient}
+			if data.TLSALPN != "" {
+				tlsObj["alpn"] = data.TLSALPN
+			}
 			ecs["tls"] = tlsObj
 		}
 	}
@@ -180,18 +198,22 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 			if m := httpReqLineRe.FindStringSubmatch(reqLine); m != nil {
 				method := m[1]
 				path := m[2]
+				version := ""
+				if len(m) > 3 {
+					version = m[3]
+				}
 
 				// Check for header terminator or Host header presence
 				hasTerminator := strings.Contains(payload, "\r\n\r\n")
 				hasHost := false
 				headers := map[string]string{}
+				headerNamesInOrder := []string{}
 				bodyStartIndex := -1
 
 				// Walk lines after request-line to collect headers until blank line
 				for i, ln := range lines[1:] {
 					if ln == "" { // end of headers
 						// Compute body start offset in original payload (if any)
-						// header section is everything up to and including this CRLF
 						idx := strings.Index(payload, "\r\n\r\n")
 						if idx != -1 && idx+4 <= len(payload) {
 							bodyStartIndex = idx + 4
@@ -208,9 +230,10 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 						value := strings.TrimSpace(ln[idx+1:])
 						if name != "" {
 							headers[strings.ToLower(name)] = value
+							headerNamesInOrder = append(headerNamesInOrder, name)
 						}
 					}
-					_ = i // silence unused warning in case
+					_ = i
 				}
 
 				// If ALPN indicates HTTP (e.g. http/1.1 or h2) we can be more permissive
@@ -224,6 +247,13 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 					reqObj := map[string]interface{}{"method": method}
 					if len(headers) > 0 {
 						reqObj["headers"] = headers
+					}
+					// HTTP request fingerprint: method, version, header order, cookie/referer/lang
+					http_fp := fingerprint.HTTPFP(method, version, headerNamesInOrder,
+						headers["cookie"] != "", headers["referer"] != "",
+						headers["accept-language"])
+					if http_fp != "" {
+						reqObj["hash"] = map[string]interface{}{"http_fp": http_fp}
 					}
 					httpObj["request"] = reqObj
 
@@ -280,6 +310,15 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 					"summary": data.Payload,
 				}
 			}
+		}
+	}
+
+	// SSH client fingerprint (Hassh) when present
+	if data.SSHHassh != "" {
+		ecs["ssh"] = map[string]interface{}{
+			"client": map[string]interface{}{
+				"hash": map[string]interface{}{"hassh": data.SSHHassh},
+			},
 		}
 	}
 

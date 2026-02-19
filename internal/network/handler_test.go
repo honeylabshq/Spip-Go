@@ -76,7 +76,7 @@ func TestHandleConnection(t *testing.T) {
 	}
 
 	// Create network handler
-	handler := NewHandler(mock, nil, 20, 50000, 30*time.Second, 10*time.Second, "test-agent")
+	handler := NewHandler(mock, nil, 20, 50000, 30*time.Second, 10*time.Second, "test-agent", 0)
 
 	// Accept connection in goroutine
 	connChan := make(chan *net.TCPConn)
@@ -192,7 +192,7 @@ func TestHandleConnectionWithTLS(t *testing.T) {
 	}
 
 	// Create network handler
-	handler := NewHandler(mock, tlsHandler, 20, 50000, 30*time.Second, 10*time.Second, "test-agent")
+	handler := NewHandler(mock, tlsHandler, 20, 50000, 30*time.Second, 10*time.Second, "test-agent", 0)
 
 	// Start server in goroutine
 	serverDone := make(chan struct{})

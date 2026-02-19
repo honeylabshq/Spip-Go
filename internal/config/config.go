@@ -21,17 +21,18 @@ type LoomConfig struct {
 }
 
 type Config struct {
-	Name     string `toml:"name"`
-	IP       string `toml:"ip"`
-	Port     uint16 `toml:"port"`
-	CertPath string `toml:"cert_path,omitempty"`
-	KeyPath  string `toml:"key_path,omitempty"`
-	LogFile  string `toml:"log_file,omitempty"`
-	ReadTimeoutSeconds  int `toml:"read_timeout_seconds,omitempty"`
-	WriteTimeoutSeconds int `toml:"write_timeout_seconds,omitempty"`
-	RateLimitPerSecond  int `toml:"rate_limit_per_second,omitempty"`
-	RateLimitBurst      int `toml:"rate_limit_burst,omitempty"`
-	Loom     LoomConfig `toml:"loom,omitempty"`
+	Name               string `toml:"name"`
+	IP                 string `toml:"ip"`
+	Port               uint16 `toml:"port"`
+	CertPath           string `toml:"cert_path,omitempty"`
+	KeyPath            string `toml:"key_path,omitempty"`
+	LogFile            string `toml:"log_file,omitempty"`
+	ReadTimeoutSeconds int    `toml:"read_timeout_seconds,omitempty"`
+	WriteTimeoutSeconds int   `toml:"write_timeout_seconds,omitempty"`
+	RateLimitPerSecond int    `toml:"rate_limit_per_second,omitempty"`
+	RateLimitBurst     int    `toml:"rate_limit_burst,omitempty"`
+	CommunityIDSeed    uint16 `toml:"community_id_seed,omitempty"` // optional; 0 = default per Community ID v1 spec
+	Loom               LoomConfig `toml:"loom,omitempty"`
 }
 
 func LoadConfig(path string) (*Config, error) {

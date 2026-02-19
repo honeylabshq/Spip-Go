@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"github.com/psanford/tlsfingerprint"
 )
 
 // Config represents TLS configuration
@@ -58,19 +59,52 @@ func IsTLSHandshake(reader *bufio.Reader) bool {
 	return len(firstByte) == 1 && firstByte[0] == 0x16
 }
 
-// WrapConnection wraps a TCP connection with TLS if it detects a TLS handshake
-func (h *TLSHandler) WrapConnection(conn net.Conn) (net.Conn, bool, error) {
-	// Create a buffered reader to peek at the first bytes
-	reader := bufio.NewReader(conn)
+// ClientHelloInfo holds data extracted from the TLS ClientHello (for fingerprinting).
+// Pass a non-nil pointer to WrapConnection to populate it when the connection is TLS.
+type ClientHelloInfo struct {
+	JA4                 string   // JA4 fingerprint string
+	SupportedProtocols   []string // ALPN protocols advertised by client (tls.client.supported_protocols)
+}
 
-	// Check if this is a TLS handshake
-	if !IsTLSHandshake(reader) {
-		// Not a TLS connection, return original connection
-		return &readWriteConn{reader, conn}, false, nil
+// prefixConn implements net.Conn by serving a prefix buffer first, then the underlying Conn.
+type prefixConn struct {
+	prefix []byte
+	net.Conn
+}
+
+func (c *prefixConn) Read(p []byte) (n int, err error) {
+	if len(c.prefix) > 0 {
+		n = copy(p, c.prefix)
+		c.prefix = c.prefix[n:]
+		return n, nil
+	}
+	return c.Conn.Read(p)
+}
+
+// WrapConnection wraps a TCP connection with TLS if it detects a TLS handshake.
+// If out is non-nil and the connection is TLS, out is populated with JA4 and supported ALPN protocols from the ClientHello.
+func (h *TLSHandler) WrapConnection(conn net.Conn, out *ClientHelloInfo) (net.Conn, bool, error) {
+	// Read exactly one byte so we can replay it; avoids bufio buffering extra bytes.
+	buf := make([]byte, 1)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return nil, false, fmt.Errorf("read first byte: %w", err)
+	}
+	if buf[0] != 0x16 {
+		// Not TLS: replay the byte for the next reader
+		return &prefixConn{prefix: buf, Conn: conn}, false, nil
+	}
+	connWithPrefix := &prefixConn{prefix: buf, Conn: conn}
+
+	fp, replayConn, err := tlsfingerprint.FingerprintConn(connWithPrefix)
+	if err != nil {
+		return nil, true, fmt.Errorf("TLS ClientHello fingerprint: %w", err)
+	}
+	if out != nil {
+		out.JA4 = fp.JA4String()
+		out.SupportedProtocols = fp.ALPNProtocols
 	}
 
-	// It's a TLS connection, wrap it
-	tlsConn := tls.Server(&readWriteConn{reader, conn}, h.config)
+	tlsConn := tls.Server(replayConn, h.config)
 	if err := tlsConn.Handshake(); err != nil {
 		return nil, true, fmt.Errorf("TLS handshake failed: %w", err)
 	}

@@ -99,6 +99,9 @@ EOF
         echo "rate_limit_burst = ${CFG_BURST}" >> "$cfgpath"
     fi
 
+    # Optional: Community ID v1 seed (omit or 0 for default). Fingerprinting is always on.
+    echo "# community_id_seed = 0" >> "$cfgpath"
+
     if [ "${CFG_LOOM_ENABLED:-0}" = "1" ] && [ -n "${CFG_LOOM_URL:-}" ] && [ -n "${CFG_LOOM_SENSOR_ID:-}" ] && [ -n "${CFG_LOOM_TOKEN:-}" ]; then
         cat >> "$cfgpath" <<EOF
 

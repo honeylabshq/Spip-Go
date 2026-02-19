@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"spip/internal/fingerprint"
 	"spip/internal/logging"
 	"spip/internal/tls"
 	"spip/pkg/socket"
@@ -23,17 +24,19 @@ import (
 
 // Handler handles network connections
 type Handler struct {
-	logger       logging.Logger
-	tlsHandler   *tls.TLSHandler
-	limiter      *rate.Limiter
-	connections  sync.Map
-	readTimeout  time.Duration
-	writeTimeout time.Duration
-	name         string
+	logger            logging.Logger
+	tlsHandler        *tls.TLSHandler
+	limiter           *rate.Limiter
+	connections       sync.Map
+	readTimeout       time.Duration
+	writeTimeout      time.Duration
+	name              string
+	communityIDSeed   uint16
 }
 
-// NewHandler creates a new network handler
-func NewHandler(logger logging.Logger, tlsHandler *tls.TLSHandler, ratePerSec float64, burst int, readTimeout, writeTimeout time.Duration, name string) *Handler {
+// NewHandler creates a new network handler.
+// communityIDSeed is passed to Community ID v1 hashing (0 = default).
+func NewHandler(logger logging.Logger, tlsHandler *tls.TLSHandler, ratePerSec float64, burst int, readTimeout, writeTimeout time.Duration, name string, communityIDSeed uint16) *Handler {
 	if ratePerSec <= 0 {
 		ratePerSec = 20
 	}
@@ -48,12 +51,13 @@ func NewHandler(logger logging.Logger, tlsHandler *tls.TLSHandler, ratePerSec fl
 	}
 
 	return &Handler{
-		logger:       logger,
-		tlsHandler:   tlsHandler,
-		limiter:      rate.NewLimiter(rate.Limit(ratePerSec), burst),
-		readTimeout:  readTimeout,
-		writeTimeout: writeTimeout,
-		name:         name,
+		logger:          logger,
+		tlsHandler:      tlsHandler,
+		limiter:         rate.NewLimiter(rate.Limit(ratePerSec), burst),
+		readTimeout:     readTimeout,
+		writeTimeout:    writeTimeout,
+		name:            name,
+		communityIDSeed: communityIDSeed,
 	}
 }
 
@@ -212,8 +216,11 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 	var tlsClientIssuer string
 	var tlsClientNotBefore int64
 	var tlsClientNotAfter int64
+	var tlsJA4 string
+	var tlsSupportedProtocols []string
 	if h.tlsHandler != nil {
-		wrappedConn, isTLS, err := h.tlsHandler.WrapConnection(conn)
+		var clientHello tls.ClientHelloInfo
+		wrappedConn, isTLS, err := h.tlsHandler.WrapConnection(conn, &clientHello)
 		if err != nil {
 			if isTLS {
 				return // Silently fail TLS handshake
@@ -257,6 +264,8 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 					}
 				}
 				stream = tls.NewTLSStream(wrappedConn)
+				tlsJA4 = clientHello.JA4
+				tlsSupportedProtocols = clientHello.SupportedProtocols
 			} else {
 				stream = tls.NewPlainStream(wrappedConn)
 			}
@@ -299,25 +308,36 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 				return
 			}
 
+			payloadBytes := buffer[:n]
+			// Community ID uses original destination (before iptables REDIRECT) so flow hash matches other tools.
+			communityID := fingerprint.CommunityIDV1(remoteAddr.IP.String(), origDst.IP.String(), uint16(remoteAddr.Port), origDst.Port, 6, h.communityIDSeed)
+			var sshHassh string
+			if fingerprint.IsSSHClientPayload(payloadBytes) {
+				sshHassh = fingerprint.Hassh(payloadBytes)
+			}
 			connData := &logging.ConnectionData{
-				Name:               h.name,
-				Timestamp:          time.Now().Unix(),
-				Payload:            string(buffer[:n]),
-				PayloadHex:         hex.EncodeToString(buffer[:n]),
-				SourceIP:           remoteAddr.IP.String(),
-				SourcePort:         uint16(remoteAddr.Port),
-				DestinationIP:      origDst.IP.String(),
-				DestinationPort:    origDst.Port,
-				SessionID:          sessionID,
-				IsTLS:              stream.IsTLS(),
-				TLSALPN:            tlsALPN,
-				TLSServerName:      tlsServerName,
-				TLSVersion:         tlsVersion,
-				TLSCipherSuite:     tlsCipherSuite,
-				TLSClientSubject:   tlsClientSubject,
-				TLSClientIssuer:    tlsClientIssuer,
-				TLSClientNotBefore: tlsClientNotBefore,
-				TLSClientNotAfter:  tlsClientNotAfter,
+				Name:                 h.name,
+				Timestamp:            time.Now().Unix(),
+				Payload:              string(payloadBytes),
+				PayloadHex:           hex.EncodeToString(payloadBytes),
+				SourceIP:             remoteAddr.IP.String(),
+				SourcePort:           uint16(remoteAddr.Port),
+				DestinationIP:        origDst.IP.String(),
+				DestinationPort:      origDst.Port,
+				SessionID:            sessionID,
+				IsTLS:                stream.IsTLS(),
+				TLSALPN:              tlsALPN,
+				TLSServerName:        tlsServerName,
+				TLSVersion:           tlsVersion,
+				TLSCipherSuite:       tlsCipherSuite,
+				TLSClientSubject:     tlsClientSubject,
+				TLSClientIssuer:      tlsClientIssuer,
+				TLSClientNotBefore:   tlsClientNotBefore,
+				TLSClientNotAfter:    tlsClientNotAfter,
+				CommunityID:          communityID,
+				TLSSupportedProtocols: tlsSupportedProtocols,
+				TLSJA4:               tlsJA4,
+				SSHHassh:             sshHassh,
 			}
 
 			if err := h.logger.LogConnection(connData); err != nil {
