@@ -140,7 +140,11 @@ Run unit tests with:
 go test ./...
 ```
 
-End-to-end tests require privileges to manipulate `iptables` and are runnable via the included container helper scripts (see `scripts/`). They validate core behaviour (payload capture, source/destination, TLS detection, Loom batching). New fingerprint fields are additive and do not change what the e2e tests assert; if you run e2e in an environment without iptables or with different redirect rules, some tests may be skipped or fail as before.
+**End-to-end tests** require privileges to manipulate `iptables`. Run them via the script (from the repo root):
+```bash
+sudo -E ./scripts/run_e2e_tests.sh
+```
+The script sets up the environment and iptables. Alternatively use the container helper: `./scripts/run_e2e_in_container.sh`. E2E validates core behaviour (payload capture, source/destination, TLS detection, Loom batching, fingerprinting).
 
 ## Notes on HTTP parsing and deployment
 
