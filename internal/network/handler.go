@@ -294,6 +294,29 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 				return
 			}
 
+			payloadBytes := buffer[:n]
+			// SSH Hassh requires client banner and KEXINIT. Protocol has client send banner then wait for server banner before KEXINIT.
+			// When we only have the banner, send a minimal server banner and read again to capture KEXINIT.
+			if fingerprint.IsSSHClientPayload(payloadBytes) && fingerprint.Hassh(payloadBytes) == "" {
+				const sshServerBanner = "SSH-2.0-spip\r\n"
+				conn.SetWriteDeadline(time.Now().Add(h.writeTimeout))
+				if _, errW := stream.Write([]byte(sshServerBanner)); errW != nil {
+					// Use banner-only payload
+				} else {
+					// Preserve first read before second read overwrites buffer
+					clientBanner := make([]byte, n)
+					copy(clientBanner, buffer[:n])
+					conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+					n2, err2 := stream.Read(buffer)
+					conn.SetReadDeadline(time.Time{})
+					if err2 == nil && n2 > 0 {
+						combined := make([]byte, n+n2)
+						copy(combined, clientBanner)
+						copy(combined[n:], buffer[:n2])
+						payloadBytes = combined
+					}
+				}
+			}
 			var response []byte
 			if isHTTPRequest(buffer[:n]) {
 				response = handleHTTPRequest(buffer[:n], remoteAddr.IP.String())
@@ -301,14 +324,10 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 				// For non-HTTP requests, return just the IP
 				response = []byte(remoteAddr.IP.String())
 			}
-
 			conn.SetWriteDeadline(time.Now().Add(h.writeTimeout))
-
 			if _, err := stream.Write(response); err != nil {
 				return
 			}
-
-			payloadBytes := buffer[:n]
 			// Community ID uses original destination (before iptables REDIRECT) so flow hash matches other tools.
 			communityID := fingerprint.CommunityIDV1(remoteAddr.IP.String(), origDst.IP.String(), uint16(remoteAddr.Port), origDst.Port, 6, h.communityIDSeed)
 			var sshHassh string

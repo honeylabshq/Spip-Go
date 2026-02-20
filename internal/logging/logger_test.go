@@ -203,8 +203,7 @@ func TestLogConnection(t *testing.T) {
 	}
 }
 
-// TestLogConnection_Fingerprinting verifies that when ConnectionData has fingerprint fields set,
-// the ECS output contains network.community_id, tls.client.*, http.request.hash.http_fp, ssh.client.hash.hassh.
+// TestLogConnection_Fingerprinting verifies ECS fingerprint fields: network.community_id, tls.client.*, http.request.hash.http_fp, ssh.client.hash.hassh.
 func TestLogConnection_Fingerprinting(t *testing.T) {
 	tmpFile, err := os.CreateTemp("", "spip-fp-test")
 	if err != nil {
@@ -279,7 +278,7 @@ func TestLogConnection_Fingerprinting(t *testing.T) {
 		t.Fatal("missing tls object")
 	}
 
-	// http.request.hash.http_fp is computed from payload in logger (not from ConnectionData); just assert it appears for HTTP-like payload
+	// http.request.hash.http_fp is derived from payload in logger; assert present for HTTP-like payload
 	if httpObj, ok := logged["http"].(map[string]interface{}); ok {
 		if req, ok := httpObj["request"].(map[string]interface{}); ok {
 			if hash, ok := req["hash"].(map[string]interface{}); ok {

@@ -1,6 +1,8 @@
 //go:build e2e
 // +build e2e
 
+// E2E tests require iptables and privileges. Run via scripts/run_e2e_tests.sh or scripts/run_e2e_in_container.sh.
+
 package e2e
 
 import (
@@ -433,7 +435,7 @@ func TestTLSConnection(t *testing.T) {
 	}
 }
 
-// buildSSHKEXINITPayload builds a minimal SSH-2.0 banner + KEXINIT packet so the agent can compute Hassh.
+// buildSSHKEXINITPayload builds a minimal SSH-2.0 banner plus KEXINIT packet for Hassh fingerprinting.
 func buildSSHKEXINITPayload() []byte {
 	// SSH-2.0 banner
 	banner := []byte("SSH-2.0-e2e_test\r\n")
@@ -517,6 +519,60 @@ func TestSSHFingerprint(t *testing.T) {
 	if !foundSSH {
 		t.Error("expected ssh.client.hash.hassh to be set for SSH KEXINIT payload")
 	}
+}
+
+// TestSSHFingerprintRealClient verifies ssh.client.hash.hassh is populated when the system ssh client connects.
+func TestSSHFingerprintRealClient(t *testing.T) {
+	if _, err := exec.LookPath("ssh"); err != nil {
+		t.Skip("ssh not in PATH, skipping real-client test")
+	}
+	env := setupTestEnv(t, false)
+	defer env.cleanup()
+
+	// Redirect port 2222 to agent so ssh -p 2222 connects to the agent
+	cmd := exec.Command("iptables", "-t", "nat", "-A", "OUTPUT",
+		"-p", "tcp",
+		"-d", testHost,
+		"--dport", "2222",
+		"-j", "REDIRECT",
+		"--to-port", fmt.Sprintf("%d", testPort))
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("failed to add iptables redirect for port 2222: %v", err)
+	}
+
+	// Run ssh; connection fails (agent is not an SSH server) but agent captures banner and KEXINIT for Hassh
+	sshCmd := exec.Command("ssh",
+		"-p", "2222",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "ConnectTimeout=3",
+		"-o", "BatchMode=yes",
+		testHost)
+	_ = sshCmd.Run()
+
+	time.Sleep(300 * time.Millisecond)
+	output := env.getStdout()
+	var hassh string
+	for _, line := range strings.Split(output, "\n") {
+		if line == "" {
+			continue
+		}
+		entry, err := ParseLogLine(line)
+		if err != nil {
+			continue
+		}
+		if entry.DestinationPort == 2222 && entry.SSHHassh != "" {
+			hassh = entry.SSHHassh
+			break
+		}
+	}
+	if hassh == "" {
+		t.Fatal("expected ssh.client.hash.hassh to be set for SSH connection")
+	}
+	if len(hassh) != 32 {
+		t.Errorf("expected ssh.client.hash.hassh to be 32-char hex, got %q", hassh)
+	}
+	t.Logf("real ssh client produced hassh: %s", hassh)
 }
 
 func TestLoomShipper(t *testing.T) {
