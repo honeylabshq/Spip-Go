@@ -7,5 +7,4 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /work
 COPY . /work
 
-# Build spip-agent so the binary is available if needed during test runs
 RUN go build -o spip-agent ./cmd/spip-agent || true
