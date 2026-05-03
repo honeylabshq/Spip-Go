@@ -130,7 +130,7 @@ Part of [log output](#log-output): when `[loom]` has `enabled = true`, the same 
 .
 ├── cmd/                 # Main application entry point
 ├── internal/            # Config, logging, network, TLS, fingerprinting, exporters (e.g. Loom)
-├── pkg/                 # cgo helpers (socket operations)
+├── pkg/                 # Linux socket helpers (SO_ORIGINAL_DST via syscall)
 ├── test/                # End-to-end test helpers
 └── scripts/             # Utility scripts (including `initial_setup.sh`)
 ```

@@ -55,7 +55,7 @@ type ConnectionData struct {
 
 	// Fingerprinting (ECS)
 	CommunityID           string   `json:"community_id,omitempty"`            // network.community_id
-	TLSSupportedProtocols []string `json:"tls_supported_protocols,omitempty"`   // tls.client.supported_protocols (ALPN list from ClientHello)
+	TLSSupportedProtocols []string `json:"tls_supported_protocols,omitempty"` // tls.client.supported_protocols (ALPN list from ClientHello)
 	TLSJA4                string   `json:"tls_ja4,omitempty"`                 // tls.client.hash.ja4
 	HTTPJA4H              string   `json:"http_ja4h,omitempty"`               // http.request.hash.ja4h
 	SSHHassh              string   `json:"ssh_hassh,omitempty"`               // ssh.client.hash.hassh
@@ -211,7 +211,7 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 				bodyStartIndex := -1
 
 				// Walk lines after request-line to collect headers until blank line
-				for i, ln := range lines[1:] {
+				for _, ln := range lines[1:] {
 					if ln == "" { // end of headers
 						// Compute body start offset in original payload (if any)
 						idx := strings.Index(payload, "\r\n\r\n")
@@ -233,7 +233,6 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 							headerNamesInOrder = append(headerNamesInOrder, name)
 						}
 					}
-					_ = i
 				}
 
 				// If ALPN indicates HTTP (e.g. http/1.1 or h2) we can be more permissive

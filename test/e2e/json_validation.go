@@ -11,21 +11,21 @@ import (
 
 // LogEntry represents the JSON log format output by the SPIP agent
 type LogEntry struct {
-	Timestamp       int64    `json:"timestamp"`
-	Level           string   `json:"level,omitempty"`
-	Message         string   `json:"message,omitempty"`
-	Target          string   `json:"target,omitempty"`
-	RecordType      string   `json:"record_type,omitempty"`
-	Payload         string   `json:"payload,omitempty"`
-	PayloadHex      string   `json:"payload_hex,omitempty"`
-	SourceIP        string   `json:"source_ip,omitempty"`
-	SourcePort      int      `json:"source_port,omitempty"`
-	DestinationIP   string   `json:"destination_ip,omitempty"`
-	DestinationPort int      `json:"destination_port,omitempty"`
-	SessionID       string   `json:"session_id,omitempty"`
-	IsTLS           bool     `json:"is_tls,omitempty"`
-	TLSVersion      string   `json:"tls_version,omitempty"`
-	TLSCipherSuite  string   `json:"tls_cipher_suite,omitempty"`
+	Timestamp       int64  `json:"timestamp"`
+	Level           string `json:"level,omitempty"`
+	Message         string `json:"message,omitempty"`
+	Target          string `json:"target,omitempty"`
+	RecordType      string `json:"record_type,omitempty"`
+	Payload         string `json:"payload,omitempty"`
+	PayloadHex      string `json:"payload_hex,omitempty"`
+	SourceIP        string `json:"source_ip,omitempty"`
+	SourcePort      int    `json:"source_port,omitempty"`
+	DestinationIP   string `json:"destination_ip,omitempty"`
+	DestinationPort int    `json:"destination_port,omitempty"`
+	SessionID       string `json:"session_id,omitempty"`
+	IsTLS           bool   `json:"is_tls,omitempty"`
+	TLSVersion      string `json:"tls_version,omitempty"`
+	TLSCipherSuite  string `json:"tls_cipher_suite,omitempty"`
 	// Fingerprinting (ECS)
 	CommunityID           string   `json:"community_id,omitempty"`
 	TLSServerName         string   `json:"tls_server_name,omitempty"`
@@ -116,12 +116,14 @@ func ParseLogLine(line string) (*LogEntry, error) {
 		}
 	}
 
-	// 2) http.request.body (HTTP payloads) - only used if event.summary wasn't present
+	// 2) http.request.body.content (HTTP payloads) - only used if event.summary wasn't present
 	if entry.Payload == "" {
 		if httpObj, ok := m["http"].(map[string]interface{}); ok {
 			if req, ok := httpObj["request"].(map[string]interface{}); ok {
-				if body, ok := req["body"].(string); ok {
-					entry.Payload = body
+				if bodyObj, ok := req["body"].(map[string]interface{}); ok {
+					if content, ok := bodyObj["content"].(string); ok {
+						entry.Payload = content
+					}
 				}
 			}
 		}

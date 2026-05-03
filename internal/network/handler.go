@@ -4,13 +4,9 @@ import (
 	"bytes"
 	cryptotls "crypto/tls"
 	"encoding/hex"
-	"errors"
 	"fmt"
-	"io"
 	"net"
-	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"spip/internal/fingerprint"
@@ -24,14 +20,14 @@ import (
 
 // Handler handles network connections
 type Handler struct {
-	logger            logging.Logger
-	tlsHandler        *tls.TLSHandler
-	limiter           *rate.Limiter
-	connections       sync.Map
-	readTimeout       time.Duration
-	writeTimeout      time.Duration
-	name              string
-	communityIDSeed   uint16
+	logger          logging.Logger
+	tlsHandler      *tls.TLSHandler
+	limiter         *rate.Limiter
+	connections     sync.Map
+	readTimeout     time.Duration
+	writeTimeout    time.Duration
+	name            string
+	communityIDSeed uint16
 }
 
 // NewHandler creates a new network handler.
@@ -104,79 +100,6 @@ func handleHTTPRequest(data []byte, sourceIP string) []byte {
 	return []byte(fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", len(sourceIP), sourceIP))
 }
 
-// isConnectionClosed checks if an error indicates a closed connection
-func isConnectionClosed(err error) bool {
-	if err == nil {
-		return false
-	}
-	if err == io.EOF {
-		return true
-	}
-	if netErr, ok := err.(net.Error); ok {
-		return netErr.Timeout() || netErr.Temporary()
-	}
-	// Common scanner behavior: connection reset or broken pipe
-	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
-		return true
-	}
-	// Fallback string checks for platforms or wrappers that expose textual errors
-	if strings.Contains(err.Error(), "connection reset by peer") || strings.Contains(err.Error(), "broken pipe") {
-		return true
-	}
-	return false
-}
-
-// shouldLogError determines if an error should be logged
-func shouldLogError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	// Only log errors that are not connection-related
-	if strings.Contains(err.Error(), "tls:") ||
-		strings.Contains(err.Error(), "read:") ||
-		strings.Contains(err.Error(), "write:") ||
-		strings.Contains(err.Error(), "i/o timeout") ||
-		err == io.EOF ||
-		isConnectionClosed(err) {
-		return false
-	}
-
-	// Log only truly unexpected errors
-	return true
-}
-
-// classifyConnectionError categorizes connection errors for appropriate logging
-func classifyConnectionError(err error) (severity string, isExpected bool) {
-	if err == nil {
-		return "", true
-	}
-
-	// Common scanner behaviors - debug level
-	if err == io.EOF || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) || strings.Contains(err.Error(), "i/o timeout") {
-		return "debug", true
-	}
-
-	// Expected TLS probing behaviors - info level
-	if strings.Contains(err.Error(), "tls: first record does not look like a TLS handshake") ||
-		strings.Contains(err.Error(), "tls: bad certificate") ||
-		strings.Contains(err.Error(), "tls: handshake failure") ||
-		strings.Contains(err.Error(), "tls: client offered only unsupported versions") ||
-		strings.Contains(err.Error(), "tls: no cipher suite supported") {
-		return "info", true
-	}
-
-	// Network timeouts and temporary errors - debug level
-	if netErr, ok := err.(net.Error); ok {
-		if netErr.Timeout() || netErr.Temporary() {
-			return "debug", true
-		}
-	}
-
-	// Anything else might be worth investigating
-	return "error", false
-}
-
 // HandleConnection handles an incoming TCP connection
 func (h *Handler) HandleConnection(conn *net.TCPConn) {
 	conn.SetKeepAlive(true)
@@ -191,10 +114,7 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 	connID := uuid.New().String()
 	h.connections.Store(connID, conn)
 
-	done := make(chan struct{})
-
 	defer func() {
-		close(done)
 		h.connections.Delete(connID)
 		conn.Close()
 	}()
@@ -279,96 +199,92 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 	buffer := make([]byte, 16384)
 
 	for {
-		select {
-		case <-done:
+		conn.SetReadDeadline(time.Now().Add(h.readTimeout))
+
+		n, err := stream.Read(buffer)
+		if err != nil {
 			return
-		default:
-			conn.SetReadDeadline(time.Now().Add(h.readTimeout))
+		}
 
-			n, err := stream.Read(buffer)
-			if err != nil {
-				return
+		if n == 0 {
+			return
+		}
+
+		// Coalesce TCP segments arriving in quick succession to avoid split log events.
+		payloadBytes := make([]byte, n)
+		copy(payloadBytes, buffer[:n])
+		conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		for {
+			n2, err2 := stream.Read(buffer)
+			if n2 > 0 {
+				payloadBytes = append(payloadBytes, buffer[:n2]...)
 			}
-
-			if n == 0 {
-				return
+			if err2 != nil {
+				break
 			}
+		}
+		conn.SetReadDeadline(time.Time{})
 
-			// Coalesce TCP segments arriving in quick succession to avoid split log events.
-			payloadBytes := make([]byte, n)
-			copy(payloadBytes, buffer[:n])
-			conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-			for {
+		// SSH Hassh requires client banner and KEXINIT. Protocol has client send banner then wait for server banner before KEXINIT.
+		// When we only have the banner, send a minimal server banner and read again to capture KEXINIT.
+		if fingerprint.IsSSHClientPayload(payloadBytes) && fingerprint.Hassh(payloadBytes) == "" {
+			const sshServerBanner = "SSH-2.0-spip\r\n"
+			conn.SetWriteDeadline(time.Now().Add(h.writeTimeout))
+			if _, errW := stream.Write([]byte(sshServerBanner)); errW != nil {
+				// Use banner-only payload
+			} else {
+				conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 				n2, err2 := stream.Read(buffer)
-				if n2 > 0 {
+				conn.SetReadDeadline(time.Time{})
+				if err2 == nil && n2 > 0 {
 					payloadBytes = append(payloadBytes, buffer[:n2]...)
 				}
-				if err2 != nil {
-					break
-				}
 			}
+		}
+		var response []byte
+		if isHTTPRequest(payloadBytes) {
+			response = handleHTTPRequest(payloadBytes, remoteAddr.IP.String())
+		} else {
+			// For non-HTTP requests, return just the IP
+			response = []byte(remoteAddr.IP.String())
+		}
+		conn.SetWriteDeadline(time.Now().Add(h.writeTimeout))
+		if _, err := stream.Write(response); err != nil {
+			return
+		}
+		// Community ID uses original destination (before iptables REDIRECT) so flow hash matches other tools.
+		communityID := fingerprint.CommunityIDV1(remoteAddr.IP.String(), origDst.IP.String(), uint16(remoteAddr.Port), origDst.Port, 6, h.communityIDSeed)
+		var sshHassh string
+		if fingerprint.IsSSHClientPayload(payloadBytes) {
+			sshHassh = fingerprint.Hassh(payloadBytes)
+		}
+		connData := &logging.ConnectionData{
+			Name:                  h.name,
+			Timestamp:             time.Now().Unix(),
+			Payload:               string(payloadBytes),
+			PayloadHex:            hex.EncodeToString(payloadBytes),
+			SourceIP:              remoteAddr.IP.String(),
+			SourcePort:            uint16(remoteAddr.Port),
+			DestinationIP:         origDst.IP.String(),
+			DestinationPort:       origDst.Port,
+			SessionID:             sessionID,
+			IsTLS:                 stream.IsTLS(),
+			TLSALPN:               tlsALPN,
+			TLSServerName:         tlsServerName,
+			TLSVersion:            tlsVersion,
+			TLSCipherSuite:        tlsCipherSuite,
+			TLSClientSubject:      tlsClientSubject,
+			TLSClientIssuer:       tlsClientIssuer,
+			TLSClientNotBefore:    tlsClientNotBefore,
+			TLSClientNotAfter:     tlsClientNotAfter,
+			CommunityID:           communityID,
+			TLSSupportedProtocols: tlsSupportedProtocols,
+			TLSJA4:                tlsJA4,
+			SSHHassh:              sshHassh,
+		}
 
-			// SSH Hassh requires client banner and KEXINIT. Protocol has client send banner then wait for server banner before KEXINIT.
-			// When we only have the banner, send a minimal server banner and read again to capture KEXINIT.
-			if fingerprint.IsSSHClientPayload(payloadBytes) && fingerprint.Hassh(payloadBytes) == "" {
-				const sshServerBanner = "SSH-2.0-spip\r\n"
-				conn.SetWriteDeadline(time.Now().Add(h.writeTimeout))
-				if _, errW := stream.Write([]byte(sshServerBanner)); errW != nil {
-					// Use banner-only payload
-				} else {
-					conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-					n2, err2 := stream.Read(buffer)
-					conn.SetReadDeadline(time.Time{})
-					if err2 == nil && n2 > 0 {
-						payloadBytes = append(payloadBytes, buffer[:n2]...)
-					}
-				}
-			}
-			var response []byte
-			if isHTTPRequest(payloadBytes) {
-				response = handleHTTPRequest(payloadBytes, remoteAddr.IP.String())
-			} else {
-				// For non-HTTP requests, return just the IP
-				response = []byte(remoteAddr.IP.String())
-			}
-			conn.SetWriteDeadline(time.Now().Add(h.writeTimeout))
-			if _, err := stream.Write(response); err != nil {
-				return
-			}
-			// Community ID uses original destination (before iptables REDIRECT) so flow hash matches other tools.
-			communityID := fingerprint.CommunityIDV1(remoteAddr.IP.String(), origDst.IP.String(), uint16(remoteAddr.Port), origDst.Port, 6, h.communityIDSeed)
-			var sshHassh string
-			if fingerprint.IsSSHClientPayload(payloadBytes) {
-				sshHassh = fingerprint.Hassh(payloadBytes)
-			}
-			connData := &logging.ConnectionData{
-				Name:                 h.name,
-				Timestamp:            time.Now().Unix(),
-				Payload:              string(payloadBytes),
-				PayloadHex:           hex.EncodeToString(payloadBytes),
-				SourceIP:             remoteAddr.IP.String(),
-				SourcePort:           uint16(remoteAddr.Port),
-				DestinationIP:        origDst.IP.String(),
-				DestinationPort:      origDst.Port,
-				SessionID:            sessionID,
-				IsTLS:                stream.IsTLS(),
-				TLSALPN:              tlsALPN,
-				TLSServerName:        tlsServerName,
-				TLSVersion:           tlsVersion,
-				TLSCipherSuite:       tlsCipherSuite,
-				TLSClientSubject:     tlsClientSubject,
-				TLSClientIssuer:      tlsClientIssuer,
-				TLSClientNotBefore:   tlsClientNotBefore,
-				TLSClientNotAfter:    tlsClientNotAfter,
-				CommunityID:          communityID,
-				TLSSupportedProtocols: tlsSupportedProtocols,
-				TLSJA4:               tlsJA4,
-				SSHHassh:             sshHassh,
-			}
-
-			if err := h.logger.LogConnection(connData); err != nil {
-				h.logger.Error("network", fmt.Sprintf("Failed to log connection data: %v", err))
-			}
+		if err := h.logger.LogConnection(connData); err != nil {
+			h.logger.Error("network", fmt.Sprintf("Failed to log connection data: %v", err))
 		}
 	}
 }
