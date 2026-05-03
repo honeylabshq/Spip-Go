@@ -4,16 +4,15 @@ import (
 	"bufio"
 	"crypto/tls"
 	"fmt"
+	"github.com/psanford/tlsfingerprint"
 	"io"
 	"net"
-	"github.com/psanford/tlsfingerprint"
 )
 
 // Config represents TLS configuration
 type Config struct {
-	CertPath           string
-	KeyPath            string
-	InsecureSkipVerify bool
+	CertPath string
+	KeyPath  string
 }
 
 // TLSHandler handles TLS connections
@@ -29,10 +28,9 @@ func NewTLSHandler(cfg *Config) (*TLSHandler, error) {
 	}
 
 	config := &tls.Config{
-		Certificates:       []tls.Certificate{cert},
-		MinVersion:         tls.VersionTLS10,
-		MaxVersion:         tls.VersionTLS13,
-		InsecureSkipVerify: cfg.InsecureSkipVerify,
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS10,
+		MaxVersion:   tls.VersionTLS13,
 		CipherSuites: []uint16{
 			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
@@ -62,8 +60,8 @@ func IsTLSHandshake(reader *bufio.Reader) bool {
 // ClientHelloInfo holds data extracted from the TLS ClientHello (for fingerprinting).
 // Pass a non-nil pointer to WrapConnection to populate it when the connection is TLS.
 type ClientHelloInfo struct {
-	JA4                 string   // JA4 fingerprint string
-	SupportedProtocols   []string // ALPN protocols advertised by client (tls.client.supported_protocols)
+	JA4                string   // JA4 fingerprint string
+	SupportedProtocols []string // ALPN protocols advertised by client (tls.client.supported_protocols)
 }
 
 // prefixConn implements net.Conn by serving a prefix buffer first, then the underlying Conn.

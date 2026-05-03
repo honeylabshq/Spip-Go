@@ -21,6 +21,9 @@ jobs:
       - name: Install dependencies
         run: go mod download
 
+      - name: Build
+        run: go build -o spip-agent ./cmd/spip-agent
+
       - name: Run unit tests
         run: |
           go test ./internal/... ./pkg/... -v -race -coverprofile=coverage.txt -covermode=atomic

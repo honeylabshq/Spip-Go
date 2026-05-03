@@ -7,9 +7,9 @@ package e2e
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -263,7 +263,7 @@ func makeHTTPRequest(t *testing.T, useTLS bool, payload []byte) ([]byte, error) 
 func makeTCPRequest(t *testing.T, useTLS bool, payload []byte) ([]byte, error) {
 	var conn net.Conn
 	var err error
-	addr := fmt.Sprintf("%s:%d", testHost, testPort)
+	addr := net.JoinHostPort(testHost, fmt.Sprintf("%d", testPort))
 	if useTLS {
 		conn, err = tls.Dial("tcp", addr, &tls.Config{
 			InsecureSkipVerify: true,
@@ -681,13 +681,6 @@ func TestLoomShipper(t *testing.T) {
 	}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 func TestConcurrentConnections(t *testing.T) {
 	env := setupTestEnv(t, true)
 	defer env.cleanup()
@@ -792,7 +785,7 @@ func TestConnectionReset(t *testing.T) {
 	defer env.cleanup()
 
 	// Test connection reset handling
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", testHost, testPort))
+	conn, err := net.Dial("tcp", net.JoinHostPort(testHost, fmt.Sprintf("%d", testPort)))
 	if err != nil {
 		t.Fatalf("Failed to create connection: %v", err)
 	}
@@ -898,7 +891,7 @@ func TestOriginalDestinationPreservationTCP(t *testing.T) {
 
 	// Make connections and track session IDs
 	for _, tc := range testCases {
-		conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", testHost, tc.port))
+		conn, err := net.Dial("tcp", net.JoinHostPort(testHost, fmt.Sprintf("%d", tc.port)))
 		if err != nil {
 			t.Fatalf("Failed to connect to port %d: %v", tc.port, err)
 		}
