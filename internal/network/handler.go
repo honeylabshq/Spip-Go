@@ -294,7 +294,20 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 				return
 			}
 
-			payloadBytes := buffer[:n]
+			// Coalesce TCP segments arriving in quick succession to avoid split log events.
+			payloadBytes := make([]byte, n)
+			copy(payloadBytes, buffer[:n])
+			conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			for {
+				n2, err2 := stream.Read(buffer)
+				if n2 > 0 {
+					payloadBytes = append(payloadBytes, buffer[:n2]...)
+				}
+				if err2 != nil {
+					break
+				}
+			}
+
 			// SSH Hassh requires client banner and KEXINIT. Protocol has client send banner then wait for server banner before KEXINIT.
 			// When we only have the banner, send a minimal server banner and read again to capture KEXINIT.
 			if fingerprint.IsSSHClientPayload(payloadBytes) && fingerprint.Hassh(payloadBytes) == "" {
@@ -303,23 +316,17 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 				if _, errW := stream.Write([]byte(sshServerBanner)); errW != nil {
 					// Use banner-only payload
 				} else {
-					// Preserve first read before second read overwrites buffer
-					clientBanner := make([]byte, n)
-					copy(clientBanner, buffer[:n])
-					conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+					conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 					n2, err2 := stream.Read(buffer)
 					conn.SetReadDeadline(time.Time{})
 					if err2 == nil && n2 > 0 {
-						combined := make([]byte, n+n2)
-						copy(combined, clientBanner)
-						copy(combined[n:], buffer[:n2])
-						payloadBytes = combined
+						payloadBytes = append(payloadBytes, buffer[:n2]...)
 					}
 				}
 			}
 			var response []byte
-			if isHTTPRequest(buffer[:n]) {
-				response = handleHTTPRequest(buffer[:n], remoteAddr.IP.String())
+			if isHTTPRequest(payloadBytes) {
+				response = handleHTTPRequest(payloadBytes, remoteAddr.IP.String())
 			} else {
 				// For non-HTTP requests, return just the IP
 				response = []byte(remoteAddr.IP.String())

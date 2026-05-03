@@ -155,6 +155,75 @@ func TestHandleConnection(t *testing.T) {
 	}
 }
 
+// TestHandleConnectionFragmentedPayload verifies that a payload delivered as two
+// separate TCP segments is coalesced into a single log event instead of being
+// recorded as two separate events (TCP reassembly).
+func TestHandleConnectionFragmentedPayload(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to create listener: %v", err)
+	}
+	defer listener.Close()
+
+	mock := &mockLogger{
+		connections: make([]*logging.ConnectionData, 0),
+		errors:      make([]string, 0),
+	}
+	handler := NewHandler(mock, nil, 20, 50000, 30*time.Second, 10*time.Second, "test-agent", 0)
+
+	handlerDone := make(chan struct{})
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			t.Errorf("accept: %v", err)
+			close(handlerDone)
+			return
+		}
+		handler.HandleConnection(conn.(*net.TCPConn))
+		close(handlerDone)
+	}()
+
+	client, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	client.(*net.TCPConn).SetNoDelay(true)
+
+	part1 := []byte("P")
+	part2 := []byte("OST /test HTTP/1.1\r\nHost: test\r\n\r\n")
+
+	// Write the first fragment and pause long enough to guarantee it lands in a
+	// separate Read() call on the server side, simulating TCP segmentation.
+	if _, err := client.Write(part1); err != nil {
+		t.Fatalf("write part1: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	if _, err := client.Write(part2); err != nil {
+		t.Fatalf("write part2: %v", err)
+	}
+
+	// Give the coalescing window time to expire, then close.
+	time.Sleep(200 * time.Millisecond)
+	client.(*net.TCPConn).CloseWrite()
+
+	select {
+	case <-handlerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for handler to finish")
+	}
+
+	if len(mock.connections) != 1 {
+		t.Fatalf("expected 1 coalesced log event, got %d (TCP fragments must not produce separate events)", len(mock.connections))
+	}
+
+	want := string(part1) + string(part2)
+	if mock.connections[0].Payload != want {
+		t.Errorf("payload mismatch:\n got  %q\n want %q", mock.connections[0].Payload, want)
+	}
+}
+
 func TestHandleConnectionWithTLS(t *testing.T) {
 	// Create temporary directory for certificates
 	tmpDir, err := os.MkdirTemp("", "spip-network-test")
