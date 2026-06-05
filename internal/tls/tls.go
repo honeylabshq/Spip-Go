@@ -29,8 +29,14 @@ func NewTLSHandler(cfg *Config) (*TLSHandler, error) {
 
 	config := &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS10,
-		MaxVersion:   tls.VersionTLS13,
+		// Ask the client for a certificate but don't require or verify it: the
+		// handshake still completes for the ~all clients that present none, and
+		// for the rare client that does we capture its cert (subject/issuer/
+		// validity) for tls.client.client_certificate.*. Never RequireAnyClientCert
+		// here — that would break the handshake for normal scanners.
+		ClientAuth: tls.RequestClientCert,
+		MinVersion: tls.VersionTLS10,
+		MaxVersion: tls.VersionTLS13,
 		CipherSuites: []uint16{
 			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,

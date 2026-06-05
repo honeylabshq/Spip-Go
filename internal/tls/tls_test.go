@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -126,6 +127,107 @@ func TestNewTLSHandler(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRequestClientCert verifies ClientAuth=RequestClientCert: the server asks
+// for a client certificate but does not require it. A client presenting none
+// must still complete the handshake (the critical safety property — most
+// scanners have no cert), and a client that does present one must have it
+// captured in ConnectionState().PeerCertificates so it can be logged.
+func TestRequestClientCert(t *testing.T) {
+	certPath, keyPath := generateTestCertificate(t)
+	defer os.RemoveAll(filepath.Dir(certPath))
+
+	handler, err := NewTLSHandler(&Config{CertPath: certPath, KeyPath: keyPath})
+	if err != nil {
+		t.Fatalf("NewTLSHandler: %v", err)
+	}
+
+	// runOnce performs one client/server TLS handshake through the handler and
+	// reports how many client certs the server observed (and the first subject).
+	runOnce := func(t *testing.T, clientCerts []tls.Certificate) (int, string) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		defer listener.Close()
+
+		type result struct {
+			n       int
+			subject string
+			err     error
+		}
+		resCh := make(chan result, 1)
+		go func() {
+			conn, err := listener.Accept()
+			if err != nil {
+				resCh <- result{err: err}
+				return
+			}
+			defer conn.Close()
+			wrapped, isTLS, err := handler.WrapConnection(conn, nil)
+			if err != nil || !isTLS {
+				resCh <- result{err: err}
+				return
+			}
+			defer wrapped.Close()
+			// Drive the handshake to completion so PeerCertificates is populated.
+			buf := make([]byte, 64)
+			_, _ = wrapped.Read(buf)
+			tc, ok := wrapped.(*tls.Conn)
+			if !ok {
+				resCh <- result{n: -1}
+				return
+			}
+			cs := tc.ConnectionState()
+			subj := ""
+			if len(cs.PeerCertificates) > 0 {
+				subj = cs.PeerCertificates[0].Subject.String()
+			}
+			resCh <- result{n: len(cs.PeerCertificates), subject: subj}
+		}()
+
+		clientConn, err := tls.Dial("tcp", listener.Addr().String(), &tls.Config{
+			InsecureSkipVerify: true,
+			Certificates:       clientCerts,
+		})
+		if err != nil {
+			t.Fatalf("client handshake failed (must always succeed): %v", err)
+		}
+		_, _ = clientConn.Write([]byte("x")) // unblock the server Read
+		clientConn.Close()
+
+		select {
+		case r := <-resCh:
+			if r.err != nil {
+				t.Fatalf("server error: %v", r.err)
+			}
+			return r.n, r.subject
+		case <-time.After(3 * time.Second):
+			t.Fatal("timeout waiting for handshake")
+			return 0, ""
+		}
+	}
+
+	t.Run("no client cert still handshakes", func(t *testing.T) {
+		if n, _ := runOnce(t, nil); n != 0 {
+			t.Errorf("expected 0 peer certs, got %d", n)
+		}
+	})
+
+	t.Run("client cert is captured", func(t *testing.T) {
+		clientCert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			t.Fatalf("load client cert: %v", err)
+		}
+		n, subj := runOnce(t, []tls.Certificate{clientCert})
+		if n < 1 {
+			t.Fatalf("expected >=1 peer cert, got %d", n)
+		}
+		if !strings.Contains(subj, "Spip Test") {
+			t.Errorf("peer cert subject = %q, want it to contain %q", subj, "Spip Test")
+		}
+	})
 }
 
 func TestTLSStream(t *testing.T) {
