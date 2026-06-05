@@ -195,6 +195,21 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 	}
 	defer stream.Close()
 
+	// Low-interaction protocol persona keyed by the original destination port
+	// (preserved across the iptables REDIRECT via SO_ORIGINAL_DST).
+	// personaDefault leaves all existing behaviour unchanged.
+	persona := personaForPort(int(origDst.Port))
+	telnetStage := 0
+	// Server-speaks-first protocols (telnet) expect the server to prompt before
+	// the client sends anything, so send the login banner before the read loop;
+	// IoT bots then proceed to send credentials.
+	if persona == personaTelnet {
+		conn.SetWriteDeadline(time.Now().Add(h.writeTimeout))
+		if _, err := stream.Write(telnetGreeting); err != nil {
+			return
+		}
+	}
+
 	sessionID := uuid.New().String()
 	buffer := make([]byte, 16384)
 
@@ -242,9 +257,27 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 			}
 		}
 		var response []byte
-		if isHTTPRequest(payloadBytes) {
+		telnetDone := false
+		switch {
+		case persona == personaTelnet:
+			// Re-prompt (don't advance) on pure IAC option negotiation so we
+			// only step the login flow on real keystrokes.
+			if !hasPrintable(payloadBytes) {
+				if telnetStage == 0 {
+					response = []byte("login: ")
+				} else {
+					response = []byte("Password: ")
+				}
+			} else {
+				response, telnetDone = telnetReply(&telnetStage)
+			}
+		case persona == personaRedis || looksLikeRedis(payloadBytes):
+			// Minimal RESP replies keep the attacker sending its full command
+			// sequence (CONFIG SET / SLAVEOF / MODULE LOAD / cron payloads).
+			response = redisReply(payloadBytes)
+		case isHTTPRequest(payloadBytes):
 			response = handleHTTPRequest(payloadBytes, remoteAddr.IP.String())
-		} else {
+		default:
 			// For non-HTTP requests, return just the IP
 			response = []byte(remoteAddr.IP.String())
 		}
@@ -285,6 +318,12 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 
 		if err := h.logger.LogConnection(connData); err != nil {
 			h.logger.Error("network", fmt.Sprintf("Failed to log connection data: %v", err))
+		}
+
+		// Telnet: after the password has been captured and logged, drop the
+		// connection like a real failed login rather than looping further.
+		if telnetDone {
+			return
 		}
 	}
 }
