@@ -137,6 +137,7 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 	var tlsClientNotBefore int64
 	var tlsClientNotAfter int64
 	var tlsJA4 string
+	var tlsJA3 string
 	var tlsSupportedProtocols []string
 	if h.tlsHandler != nil {
 		var clientHello tls.ClientHelloInfo
@@ -185,6 +186,7 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 				}
 				stream = tls.NewTLSStream(wrappedConn)
 				tlsJA4 = clientHello.JA4
+				tlsJA3 = clientHello.JA3
 				tlsSupportedProtocols = clientHello.SupportedProtocols
 			} else {
 				stream = tls.NewPlainStream(wrappedConn)
@@ -199,19 +201,24 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 	// (preserved across the iptables REDIRECT via SO_ORIGINAL_DST).
 	// personaDefault leaves all existing behaviour unchanged.
 	persona := personaForPort(int(origDst.Port))
-	telnetStage := 0
-	// Server-speaks-first protocols (telnet) expect the server to prompt before
-	// the client sends anything, so send the login banner before the read loop;
-	// IoT bots then proceed to send credentials.
-	if persona == personaTelnet {
+	stage := 0
+	// Server-speaks-first protocols (telnet, FTP, SMTP, POP3, IMAP) expect the
+	// server to send a banner/prompt before the client sends anything, so emit it
+	// before the read loop; the client then proceeds to send credentials/commands.
+	if greeting := personaGreeting(persona); greeting != nil {
 		conn.SetWriteDeadline(time.Now().Add(h.writeTimeout))
-		if _, err := stream.Write(telnetGreeting); err != nil {
+		if _, err := stream.Write(greeting); err != nil {
 			return
 		}
 	}
 
 	sessionID := uuid.New().String()
 	buffer := make([]byte, 16384)
+
+	// Behavioral metadata: cumulative within the session up to each emitted record.
+	connStart := time.Now()
+	var bytesIn, bytesOut int64
+	recordSeq := 0
 
 	for {
 		conn.SetReadDeadline(time.Now().Add(h.readTimeout))
@@ -256,21 +263,27 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 				}
 			}
 		}
+		bytesIn += int64(len(payloadBytes))
+		recordSeq++
 		var response []byte
-		telnetDone := false
+		done := false
 		switch {
 		case persona == personaTelnet:
 			// Re-prompt (don't advance) on pure IAC option negotiation so we
 			// only step the login flow on real keystrokes.
 			if !hasPrintable(payloadBytes) {
-				if telnetStage == 0 {
+				if stage == 0 {
 					response = []byte("login: ")
 				} else {
 					response = []byte("Password: ")
 				}
 			} else {
-				response, telnetDone = telnetReply(&telnetStage)
+				response, done = telnetReply(&stage)
 			}
+		case isBannerPersona(persona):
+			// FTP/SMTP/POP3/IMAP: canned status lines keep the scanner sending
+			// its credentials / envelope / commands, which we capture in payload.
+			response, done = bannerReply(persona, &stage)
 		case persona == personaRedis || looksLikeRedis(payloadBytes):
 			// Minimal RESP replies keep the attacker sending its full command
 			// sequence (CONFIG SET / SLAVEOF / MODULE LOAD / cron payloads).
@@ -285,6 +298,7 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 		if _, err := stream.Write(response); err != nil {
 			return
 		}
+		bytesOut += int64(len(response))
 		// Community ID uses original destination (before iptables REDIRECT) so flow hash matches other tools.
 		communityID := fingerprint.CommunityIDV1(remoteAddr.IP.String(), origDst.IP.String(), uint16(remoteAddr.Port), origDst.Port, 6, h.communityIDSeed)
 		var sshHassh string
@@ -313,16 +327,22 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 			CommunityID:           communityID,
 			TLSSupportedProtocols: tlsSupportedProtocols,
 			TLSJA4:                tlsJA4,
+			TLSJA3:                tlsJA3,
 			SSHHassh:              sshHassh,
+			DurationMs:            time.Since(connStart).Milliseconds(),
+			BytesIn:               bytesIn,
+			BytesOut:              bytesOut,
+			RecordSeq:             recordSeq,
 		}
 
 		if err := h.logger.LogConnection(connData); err != nil {
 			h.logger.Error("network", fmt.Sprintf("Failed to log connection data: %v", err))
 		}
 
-		// Telnet: after the password has been captured and logged, drop the
-		// connection like a real failed login rather than looping further.
-		if telnetDone {
+		// Telnet / banner protocols: after the scripted exchange ends (e.g. the
+		// password was captured), drop the connection like a real failed login
+		// rather than looping further.
+		if done {
 			return
 		}
 	}

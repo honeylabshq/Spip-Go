@@ -11,6 +11,15 @@ func TestPersonaForPort(t *testing.T) {
 		6380:  personaRedis,
 		23:    personaTelnet,
 		2323:  personaTelnet,
+		21:    personaFTP,
+		990:   personaFTP,
+		25:    personaSMTP,
+		587:   personaSMTP,
+		465:   personaSMTP,
+		110:   personaPOP3,
+		995:   personaPOP3,
+		143:   personaIMAP,
+		993:   personaIMAP,
 		80:    personaDefault,
 		443:   personaDefault,
 		8080:  personaDefault,
@@ -116,6 +125,71 @@ func TestHasPrintable(t *testing.T) {
 		if hasPrintable(p) {
 			t.Errorf("hasPrintable(%q) = true, want false", p)
 		}
+	}
+}
+
+func TestPersonaGreeting(t *testing.T) {
+	// Banner protocols (and telnet) must speak first; redis/default must not.
+	speaksFirst := []personaKind{personaTelnet, personaFTP, personaSMTP, personaPOP3, personaIMAP}
+	for _, p := range speaksFirst {
+		if personaGreeting(p) == nil {
+			t.Errorf("personaGreeting(%v) = nil, want a banner", p)
+		}
+	}
+	for _, p := range []personaKind{personaDefault, personaRedis} {
+		if personaGreeting(p) != nil {
+			t.Errorf("personaGreeting(%v) should be nil (client speaks first)", p)
+		}
+	}
+	// Banners should start with the protocol's positive status token.
+	prefixes := map[personaKind]string{
+		personaFTP:  "220 ",
+		personaSMTP: "220 ",
+		personaPOP3: "+OK",
+		personaIMAP: "* OK",
+	}
+	for p, want := range prefixes {
+		if g := personaGreeting(p); !bytes.HasPrefix(g, []byte(want)) {
+			t.Errorf("greeting(%v)=%q, want prefix %q", p, g, want)
+		}
+	}
+}
+
+func TestBannerReply(t *testing.T) {
+	// FTP: USER -> 331 (keep open), PASS -> 530 (close).
+	stage := 0
+	r, done := bannerReply(personaFTP, &stage)
+	if done || !bytes.HasPrefix(r, []byte("331")) {
+		t.Errorf("ftp step0 = %q done=%v, want 331 / not done", r, done)
+	}
+	r, done = bannerReply(personaFTP, &stage)
+	if !done || !bytes.HasPrefix(r, []byte("530")) {
+		t.Errorf("ftp step1 = %q done=%v, want 530 / done", r, done)
+	}
+
+	// IMAP: single scripted reply, closes immediately.
+	stage = 0
+	if _, done := bannerReply(personaIMAP, &stage); !done {
+		t.Error("imap should close after the first reply")
+	}
+
+	// SMTP: stays open for the envelope (EHLO/MAIL/RCPT) then closes on the last.
+	stage = 0
+	for i := 0; i < 3; i++ {
+		if _, done := bannerReply(personaSMTP, &stage); done {
+			t.Fatalf("smtp closed early at step %d", i)
+		}
+	}
+	if _, done := bannerReply(personaSMTP, &stage); !done {
+		t.Error("smtp should close after the 4th (DATA) reply")
+	}
+
+	// isBannerPersona excludes telnet (it has its own IAC path) and redis.
+	if isBannerPersona(personaTelnet) || isBannerPersona(personaRedis) {
+		t.Error("telnet/redis must not be banner personas")
+	}
+	if !isBannerPersona(personaFTP) {
+		t.Error("ftp must be a banner persona")
 	}
 }
 

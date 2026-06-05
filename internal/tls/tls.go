@@ -67,6 +67,7 @@ func IsTLSHandshake(reader *bufio.Reader) bool {
 // Pass a non-nil pointer to WrapConnection to populate it when the connection is TLS.
 type ClientHelloInfo struct {
 	JA4                string   // JA4 fingerprint string
+	JA3                string   // JA3 fingerprint (MD5 hash) — legacy, still keyed by most TI feeds
 	SupportedProtocols []string // ALPN protocols advertised by client (tls.client.supported_protocols)
 }
 
@@ -105,6 +106,7 @@ func (h *TLSHandler) WrapConnection(conn net.Conn, out *ClientHelloInfo) (net.Co
 	}
 	if out != nil {
 		out.JA4 = fp.JA4String()
+		out.JA3 = fp.JA3Hash()
 		out.SupportedProtocols = fp.ALPNProtocols
 	}
 

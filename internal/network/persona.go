@@ -15,6 +15,10 @@ const (
 	personaDefault personaKind = iota
 	personaRedis
 	personaTelnet
+	personaFTP
+	personaSMTP
+	personaPOP3
+	personaIMAP
 )
 
 // personaForPort maps an original destination port to a responder. Ports not
@@ -26,6 +30,14 @@ func personaForPort(port int) personaKind {
 		return personaRedis
 	case 23, 2323: // Telnet (+ common IoT alt port)
 		return personaTelnet
+	case 21, 990: // FTP (+ implicit FTPS)
+		return personaFTP
+	case 25, 587, 465: // SMTP, submission, SMTPS
+		return personaSMTP
+	case 110, 995: // POP3 (+ POP3S)
+		return personaPOP3
+	case 143, 993: // IMAP (+ IMAPS)
+		return personaIMAP
 	}
 	return personaDefault
 }
@@ -98,4 +110,85 @@ func telnetReply(stage *int) (reply []byte, done bool) {
 		*stage = 2
 		return []byte("\r\nLogin incorrect\r\n"), true
 	}
+}
+
+// bannerScript is a server-speaks-first protocol reduced to its bare minimum: a
+// banner sent on connect, then one canned reply per client line. The point is to
+// emit a plausible positive status code so the scanner keeps sending its next
+// line (credentials, the SMTP envelope, a command) which we capture in the
+// payload. There is no parsing of the client input and no real service — the
+// reply content barely matters, only that it keeps the exchange going briefly.
+// The last reply closes the connection like a realistic auth failure / script end.
+type bannerScript struct {
+	greeting []byte
+	replies  [][]byte
+}
+
+// bannerScripts covers the high-signal "login/command" protocols. Keep these
+// short and generic. SMTP must NEVER connect outbound — these are canned 250s,
+// so the sensor is not a mail relay.
+var bannerScripts = map[personaKind]bannerScript{
+	personaFTP: {
+		greeting: []byte("220 (vsFTPd 3.0.3)\r\n"),
+		replies: [][]byte{
+			[]byte("331 Please specify the password.\r\n"), // after USER
+			[]byte("530 Login incorrect.\r\n"),             // after PASS -> close
+		},
+	},
+	personaSMTP: {
+		greeting: []byte("220 mail ESMTP Postfix\r\n"),
+		replies: [][]byte{
+			[]byte("250-mail\r\n250 AUTH LOGIN PLAIN\r\n250 OK\r\n"), // after EHLO/HELO
+			[]byte("250 2.1.0 Ok\r\n"),                               // after MAIL FROM
+			[]byte("250 2.1.5 Ok\r\n"),                               // after RCPT TO
+			[]byte("354 End data with <CR><LF>.<CR><LF>\r\n"),        // after DATA -> close
+		},
+	},
+	personaPOP3: {
+		greeting: []byte("+OK POP3 ready\r\n"),
+		replies: [][]byte{
+			[]byte("+OK\r\n"),                // after USER
+			[]byte("-ERR invalid login\r\n"), // after PASS -> close
+		},
+	},
+	personaIMAP: {
+		greeting: []byte("* OK [CAPABILITY IMAP4rev1] ready\r\n"),
+		replies: [][]byte{
+			[]byte("* BAD Login failed\r\n"), // after LOGIN -> close
+		},
+	},
+}
+
+// personaGreeting returns the banner a server-speaks-first persona sends on
+// connect (before the first read), or nil for personas that wait for the client.
+func personaGreeting(p personaKind) []byte {
+	if p == personaTelnet {
+		return telnetGreeting
+	}
+	if s, ok := bannerScripts[p]; ok {
+		return s.greeting
+	}
+	return nil
+}
+
+// isBannerPersona reports whether p is one of the generic banner+stage protocols
+// (FTP/SMTP/POP3/IMAP). Telnet has its own IAC-aware path and is excluded here.
+func isBannerPersona(p personaKind) bool {
+	_, ok := bannerScripts[p]
+	return ok
+}
+
+// bannerReply returns the canned reply for the client's stage-th line and reports
+// whether to close after sending it (the script's last line). stage is advanced
+// in place. Lines past the script repeat the final reply.
+func bannerReply(p personaKind, stage *int) (reply []byte, done bool) {
+	s := bannerScripts[p]
+	i := *stage
+	if i >= len(s.replies) {
+		i = len(s.replies) - 1
+	}
+	reply = s.replies[i]
+	*stage++
+	done = *stage >= len(s.replies)
+	return
 }
