@@ -57,8 +57,15 @@ type ConnectionData struct {
 	CommunityID           string   `json:"community_id,omitempty"`            // network.community_id
 	TLSSupportedProtocols []string `json:"tls_supported_protocols,omitempty"` // tls.client.supported_protocols (ALPN list from ClientHello)
 	TLSJA4                string   `json:"tls_ja4,omitempty"`                 // tls.client.hash.ja4
+	TLSJA3                string   `json:"tls_ja3,omitempty"`                 // tls.client.ja3 (legacy MD5 fingerprint)
 	HTTPJA4H              string   `json:"http_ja4h,omitempty"`               // http.request.hash.ja4h
 	SSHHassh              string   `json:"ssh_hassh,omitempty"`               // ssh.client.hash.hassh
+
+	// Behavioral metadata (cumulative within the session up to this record)
+	DurationMs int64 `json:"duration_ms,omitempty"` // event.duration (emitted in ns) since connect
+	BytesIn    int64 `json:"bytes_in,omitempty"`    // source.bytes captured so far
+	BytesOut   int64 `json:"bytes_out,omitempty"`   // destination.bytes sent so far
+	RecordSeq  int   `json:"record_seq,omitempty"`  // event.sequence — this record's index in the session (1-based)
 }
 
 // Logger defines the interface for logging operations
@@ -107,20 +114,36 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 	// @timestamp in RFC3339 UTC
 	ecs["@timestamp"] = time.Unix(data.Timestamp, 0).UTC().Format(time.RFC3339Nano)
 
-	// event.id
-	ecs["event"] = map[string]interface{}{
+	// event.id (shared across all records of a connection = the session key),
+	// plus behavioral metadata: event.sequence and event.duration (nanoseconds).
+	event := map[string]interface{}{
 		"id": data.SessionID,
 	}
+	if data.RecordSeq > 0 {
+		event["sequence"] = data.RecordSeq
+	}
+	if data.DurationMs > 0 {
+		event["duration"] = data.DurationMs * 1_000_000 // ms -> ns per ECS
+	}
+	ecs["event"] = event
 
-	// source and destination
-	ecs["source"] = map[string]interface{}{
+	// source and destination (+ per-session cumulative byte counts)
+	source := map[string]interface{}{
 		"ip":   data.SourceIP,
 		"port": data.SourcePort,
 	}
-	ecs["destination"] = map[string]interface{}{
+	if data.BytesIn > 0 {
+		source["bytes"] = data.BytesIn
+	}
+	ecs["source"] = source
+	destination := map[string]interface{}{
 		"ip":   data.DestinationIP,
 		"port": data.DestinationPort,
 	}
+	if data.BytesOut > 0 {
+		destination["bytes"] = data.BytesOut
+	}
+	ecs["destination"] = destination
 
 	// observer and host hostname from agent name, if present (ECS fields)
 	if data.Name != "" {
@@ -136,6 +159,9 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 	if data.IsTLS {
 		network["protocol"] = "tls"
 	}
+	if data.BytesIn > 0 || data.BytesOut > 0 {
+		network["bytes"] = data.BytesIn + data.BytesOut
+	}
 	ecs["network"] = network
 
 	// ECS tls.client.* (server_name, supported_protocols, hash.ja4) + legacy fields
@@ -149,6 +175,9 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 		}
 		if data.TLSJA4 != "" {
 			tlsClient["hash"] = map[string]interface{}{"ja4": data.TLSJA4}
+		}
+		if data.TLSJA3 != "" {
+			tlsClient["ja3"] = data.TLSJA3 // ECS tls.client.ja3 (legacy MD5 fingerprint)
 		}
 		if data.TLSVersion != "" {
 			tlsClient["version"] = data.TLSVersion
@@ -296,17 +325,16 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 					ecs["http"] = httpObj
 				} else {
 					// Looks like a request-line but missing headers/terminator => don't
-					// classify as HTTP. Preserve payload in event.summary.
-					ecs["event"] = map[string]interface{}{
-						"id":      data.SessionID,
-						"summary": data.Payload,
+					// classify as HTTP. Preserve payload in event.summary (keeping the
+					// behavioral fields already set on the event map).
+					if ev, ok := ecs["event"].(map[string]interface{}); ok {
+						ev["summary"] = data.Payload
 					}
 				}
 			} else {
 				// Not an HTTP request-line: preserve payload in event.summary
-				ecs["event"] = map[string]interface{}{
-					"id":      data.SessionID,
-					"summary": data.Payload,
+				if ev, ok := ecs["event"].(map[string]interface{}); ok {
+					ev["summary"] = data.Payload
 				}
 			}
 		}

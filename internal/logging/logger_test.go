@@ -383,3 +383,72 @@ func TestLoggerHelperFunctions(t *testing.T) {
 		})
 	}
 }
+
+// TestLogConnection_BehavioralAndJA3 verifies the Phase 1 ECS additions:
+// tls.client.ja3, event.sequence, event.duration (ns), source.bytes,
+// destination.bytes, network.bytes.
+func TestLogConnection_BehavioralAndJA3(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "spip-beh-test")
+	if err != nil {
+		t.Fatalf("create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	logger := NewLogger(tmpFile)
+	connData := &ConnectionData{
+		Timestamp:       time.Now().Unix(),
+		Payload:         "USER root\r\n",
+		SourceIP:        "10.0.0.1",
+		SourcePort:      40000,
+		DestinationIP:   "10.0.0.2",
+		DestinationPort: 21,
+		SessionID:       "beh-session",
+		IsTLS:           true,
+		TLSJA3:          "769,47-53,0-23-65281,29-23-24,0",
+		DurationMs:      1500,
+		BytesIn:         42,
+		BytesOut:        100,
+		RecordSeq:       3,
+	}
+	if err := logger.LogConnection(connData); err != nil {
+		t.Fatalf("LogConnection: %v", err)
+	}
+	if _, err := tmpFile.Seek(0, 0); err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+	var logged map[string]interface{}
+	if err := json.NewDecoder(tmpFile).Decode(&logged); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// tls.client.ja3
+	tlsObj, _ := logged["tls"].(map[string]interface{})
+	client, _ := tlsObj["client"].(map[string]interface{})
+	if client == nil {
+		t.Fatal("missing tls.client")
+	}
+	if ja3, _ := client["ja3"].(string); ja3 != connData.TLSJA3 {
+		t.Errorf("tls.client.ja3 = %q, want %q", ja3, connData.TLSJA3)
+	}
+
+	// event.sequence + event.duration (ns)
+	event, _ := logged["event"].(map[string]interface{})
+	if seq, _ := event["sequence"].(float64); int(seq) != connData.RecordSeq {
+		t.Errorf("event.sequence = %v, want %d", event["sequence"], connData.RecordSeq)
+	}
+	if dur, _ := event["duration"].(float64); int64(dur) != connData.DurationMs*1_000_000 {
+		t.Errorf("event.duration = %v ns, want %d", event["duration"], connData.DurationMs*1_000_000)
+	}
+
+	// source.bytes / destination.bytes / network.bytes
+	if src, _ := logged["source"].(map[string]interface{}); int64(src["bytes"].(float64)) != connData.BytesIn {
+		t.Errorf("source.bytes = %v, want %d", logged["source"], connData.BytesIn)
+	}
+	if dst, _ := logged["destination"].(map[string]interface{}); int64(dst["bytes"].(float64)) != connData.BytesOut {
+		t.Errorf("destination.bytes = %v, want %d", logged["destination"], connData.BytesOut)
+	}
+	if net, _ := logged["network"].(map[string]interface{}); int64(net["bytes"].(float64)) != connData.BytesIn+connData.BytesOut {
+		t.Errorf("network.bytes = %v, want %d", logged["network"], connData.BytesIn+connData.BytesOut)
+	}
+}
