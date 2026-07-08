@@ -2,6 +2,8 @@
 
 Spip is a lightweight, low-interaction network honeypot sensor. It listens for arbitrary incoming TCP traffic (plain and TLS), captures what scanners and bots send, and logs each connection as structured JSON (ECS-shaped) for easy ingestion into your SIEM or data lake.
 
+Spip sensors power [HoneyLabs](https://honeylabs.net), a free, queryable threat intelligence platform built on the data they capture. To see what Spip collects in practice, browse the live per-IP reports there or the [weekly threat report](https://honeylabs.net/blog) generated from the sensor network.
+
 
 
 ## Quick Start
