@@ -16,6 +16,7 @@ import (
 
 	"spip/internal/logging"
 	spiptls "spip/internal/tls"
+	"spip/pkg/socket"
 )
 
 type mockLogger struct {
@@ -149,6 +150,46 @@ func TestHandleConnection(t *testing.T) {
 	}
 	if conn.IsTLS {
 		t.Error("Expected non-TLS connection")
+	}
+	if len(mock.errors) > 0 {
+		t.Errorf("Unexpected errors: %v", mock.errors)
+	}
+}
+
+func TestHandleDatagram(t *testing.T) {
+	mock := &mockLogger{
+		connections: make([]*logging.ConnectionData, 0),
+		errors:      make([]string, 0),
+	}
+	handler := NewHandler(mock, nil, 20, 50000, 30*time.Second, 10*time.Second, "test-agent", 0)
+
+	payload := []byte("\x12\x34\x01\x00dns probe")
+	remoteAddr := &net.UDPAddr{IP: net.ParseIP("192.0.2.10"), Port: 53000}
+	origDst := &socket.OriginalDst{IP: net.ParseIP("198.51.100.20"), Port: 53}
+
+	handler.HandleDatagram(payload, remoteAddr, origDst)
+
+	if len(mock.connections) != 1 {
+		t.Fatalf("Expected 1 UDP log, got %d", len(mock.connections))
+	}
+	conn := mock.connections[0]
+	if conn.Payload != string(payload) {
+		t.Errorf("Expected payload %q, got %q", string(payload), conn.Payload)
+	}
+	if conn.Transport != "udp" {
+		t.Errorf("Expected UDP transport, got %q", conn.Transport)
+	}
+	if conn.IsTLS {
+		t.Error("Expected non-TLS UDP datagram")
+	}
+	if conn.DestinationPort != 53 {
+		t.Errorf("Expected destination port 53, got %d", conn.DestinationPort)
+	}
+	if conn.CommunityID == "" {
+		t.Error("Expected UDP Community ID")
+	}
+	if conn.BytesIn != int64(len(payload)) {
+		t.Errorf("Expected bytes_in %d, got %d", len(payload), conn.BytesIn)
 	}
 	if len(mock.errors) > 0 {
 		t.Errorf("Unexpected errors: %v", mock.errors)

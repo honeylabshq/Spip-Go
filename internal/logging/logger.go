@@ -31,7 +31,7 @@ type LogMessage struct {
 	RecordType string   `json:"record_type"`
 }
 
-// ConnectionData represents TCP connection data
+// ConnectionData represents captured network flow data.
 type ConnectionData struct {
 	// Name of the agent that produced this record (optional)
 	Name               string `json:"name,omitempty"`
@@ -43,6 +43,7 @@ type ConnectionData struct {
 	DestinationIP      string `json:"destination_ip"`
 	DestinationPort    uint16 `json:"destination_port"`
 	SessionID          string `json:"session_id"`
+	Transport          string `json:"transport,omitempty"`
 	IsTLS              bool   `json:"is_tls"`
 	TLSALPN            string `json:"tls_alpn,omitempty"`
 	TLSServerName      string `json:"tls_server_name,omitempty"`
@@ -152,7 +153,11 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 	}
 
 	// network transport/protocol hints (derived from IsTLS) + Community ID
-	network := map[string]interface{}{"transport": "tcp"}
+	transport := data.Transport
+	if transport == "" {
+		transport = "tcp"
+	}
+	network := map[string]interface{}{"transport": transport}
 	if data.CommunityID != "" {
 		network["community_id"] = data.CommunityID
 	}

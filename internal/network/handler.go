@@ -100,6 +100,41 @@ func handleHTTPRequest(data []byte, sourceIP string) []byte {
 	return []byte(fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", len(sourceIP), sourceIP))
 }
 
+// HandleDatagram handles one captured UDP datagram. UDP support is deliberately
+// capture-only by default: replying generically to UDP can turn an internet
+// sensor into a reflector, and most UDP protocols need protocol-specific
+// parsing before a response is safe or useful.
+func (h *Handler) HandleDatagram(payload []byte, remoteAddr *net.UDPAddr, origDst *socket.OriginalDst) {
+	if !h.limiter.Allow() {
+		h.logger.Error("network", "UDP datagram rejected due to rate limiting")
+		return
+	}
+	if remoteAddr == nil || origDst == nil || len(payload) == 0 {
+		return
+	}
+
+	communityID := fingerprint.CommunityIDV1(remoteAddr.IP.String(), origDst.IP.String(), uint16(remoteAddr.Port), origDst.Port, 17, h.communityIDSeed)
+	connData := &logging.ConnectionData{
+		Name:            h.name,
+		Timestamp:       time.Now().Unix(),
+		Payload:         string(payload),
+		PayloadHex:      hex.EncodeToString(payload),
+		SourceIP:        remoteAddr.IP.String(),
+		SourcePort:      uint16(remoteAddr.Port),
+		DestinationIP:   origDst.IP.String(),
+		DestinationPort: origDst.Port,
+		SessionID:       uuid.New().String(),
+		Transport:       "udp",
+		CommunityID:     communityID,
+		BytesIn:         int64(len(payload)),
+		RecordSeq:       1,
+	}
+
+	if err := h.logger.LogConnection(connData); err != nil {
+		h.logger.Error("network", fmt.Sprintf("Failed to log UDP datagram data: %v", err))
+	}
+}
+
 // HandleConnection handles an incoming TCP connection
 func (h *Handler) HandleConnection(conn *net.TCPConn) {
 	conn.SetKeepAlive(true)
@@ -315,6 +350,7 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 			DestinationIP:         origDst.IP.String(),
 			DestinationPort:       origDst.Port,
 			SessionID:             sessionID,
+			Transport:             "tcp",
 			IsTLS:                 stream.IsTLS(),
 			TLSALPN:               tlsALPN,
 			TLSServerName:         tlsServerName,

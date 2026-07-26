@@ -21,6 +21,7 @@ func TestLoadConfig(t *testing.T) {
 		wantErr      bool
 		validateIP   string
 		validatePort uint16
+		validateUDP  bool
 	}{
 		{
 			name: "valid config",
@@ -45,6 +46,19 @@ func TestLoadConfig(t *testing.T) {
 			wantErr:      false,
 			validateIP:   "0.0.0.0",
 			validatePort: 8080,
+		},
+		{
+			name: "udp enabled",
+			content: `
+				name = "test-agent"
+				ip = "0.0.0.0"
+				port = 8080
+				udp_enabled = true
+			`,
+			wantErr:      false,
+			validateIP:   "0.0.0.0",
+			validatePort: 8080,
+			validateUDP:  true,
 		},
 		{
 			name: "invalid TOML",
@@ -94,6 +108,9 @@ flush_interval = "5s"
 				}
 				if cfg.Port != tt.validatePort {
 					t.Errorf("LoadConfig() Port = %v, want %v", cfg.Port, tt.validatePort)
+				}
+				if cfg.UDPEnabled != tt.validateUDP {
+					t.Errorf("LoadConfig() UDPEnabled = %v, want %v", cfg.UDPEnabled, tt.validateUDP)
 				}
 			}
 		})

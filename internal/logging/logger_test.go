@@ -307,6 +307,53 @@ func TestLogConnection_Fingerprinting(t *testing.T) {
 	}
 }
 
+func TestLogConnection_UDPTransport(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "spip-udp-log-test")
+	if err != nil {
+		t.Fatalf("create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	logger := NewLogger(tmpFile)
+	connData := &ConnectionData{
+		Timestamp:       time.Now().Unix(),
+		Payload:         "udp payload",
+		PayloadHex:      "756470207061796c6f6164",
+		SourceIP:        "192.0.2.10",
+		SourcePort:      53000,
+		DestinationIP:   "198.51.100.20",
+		DestinationPort: 53,
+		SessionID:       "udp-session",
+		Transport:       "udp",
+		CommunityID:     "1:udp",
+		BytesIn:         11,
+		RecordSeq:       1,
+	}
+
+	if err := logger.LogConnection(connData); err != nil {
+		t.Fatalf("LogConnection: %v", err)
+	}
+	if _, err := tmpFile.Seek(0, 0); err != nil {
+		t.Fatalf("seek: %v", err)
+	}
+
+	var logged map[string]interface{}
+	if err := json.NewDecoder(tmpFile).Decode(&logged); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	network, ok := logged["network"].(map[string]interface{})
+	if !ok {
+		t.Fatal("missing network object")
+	}
+	if transport, _ := network["transport"].(string); transport != "udp" {
+		t.Fatalf("network.transport = %q, want udp", transport)
+	}
+	if protocol, ok := network["protocol"]; ok {
+		t.Fatalf("network.protocol unexpectedly set for UDP: %v", protocol)
+	}
+}
+
 // TestLogConnection_LoomReceivesSameECS verifies that when ecsChan is set (Loom path), the same ECS record is sent.
 func TestLogConnection_LoomReceivesSameECS(t *testing.T) {
 	ecsChan := make(chan map[string]interface{}, 1)
