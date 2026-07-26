@@ -16,8 +16,10 @@ import (
 const (
 	solIP             = 0
 	soOriginalDst     = 80
+	ipOrigDstAddr     = 20
 	solIPv6           = 41
 	ip6tSoOriginalDst = 80
+	ipv6OrigDstAddr   = 74
 )
 
 // OriginalDst represents the original destination of a redirected connection
@@ -123,4 +125,74 @@ func GetOriginalDstAuto(conn *net.TCPConn) (*OriginalDst, error) {
 		return GetOriginalDstV6(conn)
 	}
 	return GetOriginalDst(conn)
+}
+
+// EnableUDPOriginalDst enables Linux control messages that carry the
+// pre-REDIRECT destination address for UDP packets. The returned destination is
+// read from ReadMsgUDP oob data by OriginalDstFromControlMessages.
+func EnableUDPOriginalDst(conn *net.UDPConn) error {
+	rawConn, err := conn.SyscallConn()
+	if err != nil {
+		return fmt.Errorf("failed to get raw UDP connection: %w", err)
+	}
+
+	var opErr error
+	controlErr := rawConn.Control(func(fd uintptr) {
+		enabled := false
+		if err := syscall.SetsockoptInt(int(fd), solIP, ipOrigDstAddr, 1); err != nil {
+			opErr = fmt.Errorf("setsockopt IP_RECVORIGDSTADDR: %w", err)
+		} else {
+			enabled = true
+		}
+		if err := syscall.SetsockoptInt(int(fd), solIPv6, ipv6OrigDstAddr, 1); err != nil {
+			// IPv4-only sockets can reject the IPv6 option. Keep IPv4 UDP usable
+			// and let IPv6-only listeners report the failure through tests/e2e.
+			if err != syscall.ENOPROTOOPT && err != syscall.EINVAL && opErr == nil {
+				opErr = fmt.Errorf("setsockopt IPV6_RECVORIGDSTADDR: %w", err)
+			}
+		} else {
+			enabled = true
+		}
+		if enabled {
+			opErr = nil
+		}
+	})
+	if controlErr != nil {
+		return fmt.Errorf("control error: %w", controlErr)
+	}
+	return opErr
+}
+
+// OriginalDstFromControlMessages parses UDP ReadMsgUDP oob data and returns
+// the original destination address supplied by Linux netfilter.
+func OriginalDstFromControlMessages(oob []byte) (*OriginalDst, error) {
+	msgs, err := syscall.ParseSocketControlMessage(oob)
+	if err != nil {
+		return nil, fmt.Errorf("parse control messages: %w", err)
+	}
+	for _, msg := range msgs {
+		switch {
+		case msg.Header.Level == solIP && msg.Header.Type == ipOrigDstAddr:
+			if len(msg.Data) < syscall.SizeofSockaddrInet4 {
+				return nil, fmt.Errorf("short IPv4 original destination control message")
+			}
+			addr := (*syscall.RawSockaddrInet4)(unsafe.Pointer(&msg.Data[0]))
+			portBytes := (*[2]byte)(unsafe.Pointer(&addr.Port))
+			return &OriginalDst{
+				IP:   net.IP(addr.Addr[:]),
+				Port: binary.BigEndian.Uint16(portBytes[:]),
+			}, nil
+		case msg.Header.Level == solIPv6 && msg.Header.Type == ipv6OrigDstAddr:
+			if len(msg.Data) < syscall.SizeofSockaddrInet6 {
+				return nil, fmt.Errorf("short IPv6 original destination control message")
+			}
+			addr := (*syscall.RawSockaddrInet6)(unsafe.Pointer(&msg.Data[0]))
+			portBytes := (*[2]byte)(unsafe.Pointer(&addr.Port))
+			return &OriginalDst{
+				IP:   net.IP(addr.Addr[:]),
+				Port: binary.BigEndian.Uint16(portBytes[:]),
+			}, nil
+		}
+	}
+	return nil, fmt.Errorf("original destination control message not found")
 }

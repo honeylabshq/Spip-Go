@@ -15,6 +15,7 @@ import (
 	"spip/internal/logging"
 	"spip/internal/network"
 	"spip/internal/tls"
+	"spip/pkg/socket"
 )
 
 func main() {
@@ -113,6 +114,26 @@ func main() {
 
 	fmt.Fprintf(os.Stderr, "Listening on %s\n", addr)
 
+	var udpConn *net.UDPConn
+	if cfg.UDPEnabled {
+		udpAddr, err := net.ResolveUDPAddr("udp", addr)
+		if err != nil {
+			logger.Error("main", fmt.Sprintf("Failed to resolve UDP listener address: %v", err))
+			os.Exit(1)
+		}
+		udpConn, err = net.ListenUDP("udp", udpAddr)
+		if err != nil {
+			logger.Error("main", fmt.Sprintf("Failed to create UDP listener: %v", err))
+			os.Exit(1)
+		}
+		defer udpConn.Close()
+		if err := socket.EnableUDPOriginalDst(udpConn); err != nil {
+			logger.Error("main", fmt.Sprintf("Failed to enable UDP original destination support: %v", err))
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Listening for UDP on %s\n", addr)
+	}
+
 	// Accept connections and handle graceful shutdown on signals
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -143,10 +164,46 @@ func main() {
 		}
 	}()
 
+	if udpConn != nil {
+		go func() {
+			buffer := make([]byte, 65535)
+			oob := make([]byte, 256)
+			for {
+				n, oobn, _, remoteAddr, err := udpConn.ReadMsgUDP(buffer, oob)
+				if err != nil {
+					if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
+						return
+					}
+					logger.Error("main", fmt.Sprintf("UDP read failed: %v", err))
+					return
+				}
+				if n == 0 || remoteAddr == nil {
+					continue
+				}
+				payload := make([]byte, n)
+				copy(payload, buffer[:n])
+
+				origDst, err := socket.OriginalDstFromControlMessages(oob[:oobn])
+				if err != nil {
+					if localAddr, ok := udpConn.LocalAddr().(*net.UDPAddr); ok {
+						origDst = &socket.OriginalDst{IP: localAddr.IP, Port: uint16(localAddr.Port)}
+					} else {
+						logger.Debug("main", fmt.Sprintf("failed to get UDP original destination: %v", err))
+						continue
+					}
+				}
+				go handler.HandleDatagram(payload, remoteAddr, origDst)
+			}
+		}()
+	}
+
 	// Wait for shutdown signal
 	<-stop
 	fmt.Fprintln(os.Stderr, "Shutdown signal received, closing listener")
 	listener.Close()
+	if udpConn != nil {
+		udpConn.Close()
+	}
 
 	if err := handler.Shutdown(15 * time.Second); err != nil {
 		fmt.Fprintf(os.Stderr, "Graceful shutdown completed with error: %v\n", err)

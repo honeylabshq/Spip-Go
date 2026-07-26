@@ -24,6 +24,7 @@ type Config struct {
 	Name                string     `toml:"name"`
 	IP                  string     `toml:"ip"`
 	Port                uint16     `toml:"port"`
+	UDPEnabled          bool       `toml:"udp_enabled,omitempty"`
 	CertPath            string     `toml:"cert_path,omitempty"`
 	KeyPath             string     `toml:"key_path,omitempty"`
 	LogFile             string     `toml:"log_file,omitempty"`
