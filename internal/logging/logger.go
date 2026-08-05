@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -291,10 +292,14 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 						// Split host:port if present
 						host := hostHeader
 						var portVal int
-						if colon := strings.LastIndex(hostHeader, ":"); colon != -1 {
-							host = hostHeader[:colon]
-							if p, err := strconv.Atoi(hostHeader[colon+1:]); err == nil {
+						if h, pStr, err := net.SplitHostPort(hostHeader); err == nil {
+							host = h
+							if p, err := strconv.Atoi(pStr); err == nil {
 								portVal = p
+							}
+						} else {
+							if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+								host = host[1 : len(host)-1]
 							}
 						}
 						if host != "" {
