@@ -452,3 +452,81 @@ func TestLogConnection_BehavioralAndJA3(t *testing.T) {
 		t.Errorf("network.bytes = %v, want %d", logged["network"], connData.BytesIn+connData.BytesOut)
 	}
 }
+
+// TestLogConnection_HostHeaderIPv6 pins how the Host header is split into
+// url.domain and url.port.
+//
+// The split used to be strings.LastIndex(host, ":"), which is correct for
+// "example.com:80" and wrong for every bracket-less IPv6 literal: it cut at the
+// final colon of the address itself, so "2001:db8:b73:383::a" was recorded as
+// "2001:db8:b73:383:". That silently corrupted url.domain, and downstream the
+// truncated form no longer matched the sensor-address redaction applied to the
+// public dataset, so a partial sensor address reached a published column.
+//
+// net.SplitHostPort knows the bracket rules; the fallback strips brackets for a
+// bracketed address carrying no port.
+func TestLogConnection_HostHeaderIPv6(t *testing.T) {
+	cases := []struct {
+		name       string
+		hostHeader string
+		wantDomain string
+		wantPort   int
+	}{
+		{"name only", "example.com", "example.com", 0},
+		{"name and port", "example.com:8080", "example.com", 8080},
+		{"ipv4", "1.2.3.4", "1.2.3.4", 0},
+		{"ipv4 and port", "1.2.3.4:80", "1.2.3.4", 80},
+		{"bare ipv6", "2001:db8:b73:383::a", "2001:db8:b73:383::a", 0},
+		{"bracketed ipv6", "[2001:db8:b73:383::a]", "2001:db8:b73:383::a", 0},
+		{"bracketed ipv6 and port", "[2001:db8:b73:383::a]:8080", "2001:db8:b73:383::a", 8080},
+		{"loopback ipv6", "::1", "::1", 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpFile, err := os.CreateTemp("", "spip-host-test")
+			if err != nil {
+				t.Fatalf("temp file: %v", err)
+			}
+			defer os.Remove(tmpFile.Name())
+			defer tmpFile.Close()
+
+			logger := NewLogger(tmpFile)
+			payload := "GET /probe HTTP/1.1\r\nHost: " + tc.hostHeader + "\r\n\r\n"
+			if err := logger.LogConnection(&ConnectionData{
+				Timestamp:       time.Now().Unix(),
+				Payload:         payload,
+				SourceIP:        "127.0.0.1",
+				SourcePort:      12345,
+				DestinationIP:   "192.168.1.1",
+				DestinationPort: 80,
+				SessionID:       "host-header-test",
+			}); err != nil {
+				t.Fatalf("LogConnection: %v", err)
+			}
+
+			if _, err := tmpFile.Seek(0, 0); err != nil {
+				t.Fatalf("seek: %v", err)
+			}
+			var logged map[string]interface{}
+			if err := json.NewDecoder(tmpFile).Decode(&logged); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+
+			urlObj, ok := logged["url"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("no url object in %v", logged)
+			}
+			if got, _ := urlObj["domain"].(string); got != tc.wantDomain {
+				t.Errorf("url.domain = %q, want %q", got, tc.wantDomain)
+			}
+			gotPort := 0
+			if p, ok := urlObj["port"].(float64); ok {
+				gotPort = int(p)
+			}
+			if gotPort != tc.wantPort {
+				t.Errorf("url.port = %d, want %d", gotPort, tc.wantPort)
+			}
+		})
+	}
+}
