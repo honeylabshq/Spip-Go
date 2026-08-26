@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"spip/internal/fingerprint"
@@ -82,6 +83,14 @@ type Logger interface {
 type FileLogger struct {
 	output  io.Writer
 	ecsChan chan<- map[string]interface{}
+
+	// Drops off the ECS channel. The send below is deliberately non-blocking:
+	// the honeypot must keep answering attackers even when the collector is
+	// unreachable, so shedding telemetry is the correct trade. What was wrong is
+	// that it shed silently, so a sensor could stop contributing to the pipeline
+	// for hours and look perfectly healthy from every angle.
+	ecsDropped  atomic.Uint64
+	lastDropLog atomic.Int64 // unix seconds, rate-limits the WARN
 }
 
 var httpReqLineRe = regexp.MustCompile(`^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+(\S+)\s+(HTTP/1\.[01])$`)
@@ -377,6 +386,17 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 		select {
 		case l.ecsChan <- copied:
 		default:
+			// Channel full: the loom shipper is behind or the collector is
+			// unreachable. The event is still in the local JSON log written
+			// below, so this is pipeline loss rather than data loss, but it has
+			// to be visible. Counted always, logged at most once a minute so a
+			// sustained outage cannot turn into a log flood of its own.
+			n := l.ecsDropped.Add(1)
+			now := time.Now().Unix()
+			if last := l.lastDropLog.Load(); now-last >= 60 && l.lastDropLog.CompareAndSwap(last, now) {
+				_ = l.Log(LevelWarn, "loom",
+					fmt.Sprintf("ECS channel full, dropped %d events since start (local log still has them)", n))
+			}
 		}
 	}
 
