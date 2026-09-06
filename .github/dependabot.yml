@@ -1,0 +1,30 @@
+version: 2
+
+# Spip-Go is the honeypot we publish for other people to run, so a vulnerable
+# dependency here ships to their infrastructure rather than only to ours. It had
+# no dependabot config and vulnerability alerts were disabled at the repository
+# level until 2026-09-05.
+#
+# Grouped minor and patch updates keep this to one pull request a week rather
+# than one per module. Majors come through on their own, because a Go major is a
+# new import path and is never a rubber stamp.
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        applies-to: version-updates
+        update-types: ["minor", "patch"]
+        patterns: ["*"]
