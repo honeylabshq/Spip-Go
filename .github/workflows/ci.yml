@@ -49,4 +49,11 @@ jobs:
       - name: Run E2E tests
         run: |
           cd test/e2e
-          sudo -E go test -v -race -tags=e2e ./... 
+          # `sudo go` is not the Go that setup-go installed. sudo resets PATH
+          # from secure_path in /etc/sudoers, which -E does not override, so
+          # this silently ran the runner's system Go while every other step
+          # used the pinned one. It only surfaced when go.mod moved to 1.25.0
+          # and the system Go was 1.24.13; before that the two happened to
+          # agree and the E2E suite was testing an unpinned toolchain without
+          # anyone knowing. Resolve the binary here and hand sudo the path.
+          sudo -E "$(command -v go)" test -v -race -tags=e2e ./... 
