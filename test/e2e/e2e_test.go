@@ -360,24 +360,6 @@ func TestTCPConnection(t *testing.T) {
 		t.Error("Did not find expected payload in JSON output")
 	}
 
-	// Fingerprinting: at least one HTTP log line should have JA4H (we already did HTTP request above)
-	var foundHTTPJA4H bool
-	for _, line := range strings.Split(output, "\n") {
-		if line == "" {
-			continue
-		}
-		entry, err := ParseLogLine(line)
-		if err != nil {
-			continue
-		}
-		if entry.HTTPJA4H != "" {
-			foundHTTPJA4H = true
-			break
-		}
-	}
-	if !foundHTTPJA4H {
-		t.Error("expected http.request.hash.ja4h to be set for HTTP request")
-	}
 }
 
 func TestTLSConnection(t *testing.T) {

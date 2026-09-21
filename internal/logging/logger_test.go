@@ -203,7 +203,7 @@ func TestLogConnection(t *testing.T) {
 	}
 }
 
-// TestLogConnection_Fingerprinting verifies ECS fingerprint fields: network.community_id, tls.client.*, http.request.hash.ja4h, ssh.client.hash.hassh.
+// TestLogConnection_Fingerprinting verifies ECS fingerprint fields: network.community_id, tls.client.*, ssh.client.hash.hassh.
 func TestLogConnection_Fingerprinting(t *testing.T) {
 	tmpFile, err := os.CreateTemp("", "spip-fp-test")
 	if err != nil {
@@ -228,7 +228,6 @@ func TestLogConnection_Fingerprinting(t *testing.T) {
 		CommunityID:           "1:abc123",
 		TLSSupportedProtocols: []string{"h2", "http/1.1"},
 		TLSJA4:                "t13d1516h2_8daaf6152771_e5627efa2ab1",
-		HTTPJA4H:              "ge11n00100_53b50f4ec784",
 		SSHHassh:              "92674389fa1e47a27ddd8d9b63ecd42b",
 	}
 
@@ -278,13 +277,11 @@ func TestLogConnection_Fingerprinting(t *testing.T) {
 		t.Fatal("missing tls object")
 	}
 
-	// http.request.hash.ja4h is derived from payload in logger; assert present for HTTP-like payload
+	// http.request carries no hash field.
 	if httpObj, ok := logged["http"].(map[string]interface{}); ok {
 		if req, ok := httpObj["request"].(map[string]interface{}); ok {
-			if hash, ok := req["hash"].(map[string]interface{}); ok {
-				if ja4h, _ := hash["ja4h"].(string); ja4h == "" {
-					t.Error("http.request.hash.ja4h should be set for HTTP-like payload")
-				}
+			if _, ok := req["hash"]; ok {
+				t.Error("http.request.hash should not be emitted")
 			}
 		}
 	}
