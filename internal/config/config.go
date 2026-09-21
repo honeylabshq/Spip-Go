@@ -21,18 +21,23 @@ type LoomConfig struct {
 }
 
 type Config struct {
-	Name                string     `toml:"name"`
-	IP                  string     `toml:"ip"`
-	Port                uint16     `toml:"port"`
-	CertPath            string     `toml:"cert_path,omitempty"`
-	KeyPath             string     `toml:"key_path,omitempty"`
-	LogFile             string     `toml:"log_file,omitempty"`
-	ReadTimeoutSeconds  int        `toml:"read_timeout_seconds,omitempty"`
-	WriteTimeoutSeconds int        `toml:"write_timeout_seconds,omitempty"`
-	RateLimitPerSecond  int        `toml:"rate_limit_per_second,omitempty"`
-	RateLimitBurst      int        `toml:"rate_limit_burst,omitempty"`
-	CommunityIDSeed     uint16     `toml:"community_id_seed,omitempty"` // optional; 0 = default per Community ID v1 spec
-	Loom                LoomConfig `toml:"loom,omitempty"`
+	Name                string `toml:"name"`
+	IP                  string `toml:"ip"`
+	Port                uint16 `toml:"port"`
+	CertPath            string `toml:"cert_path,omitempty"`
+	KeyPath             string `toml:"key_path,omitempty"`
+	LogFile             string `toml:"log_file,omitempty"`
+	ReadTimeoutSeconds  int    `toml:"read_timeout_seconds,omitempty"`
+	WriteTimeoutSeconds int    `toml:"write_timeout_seconds,omitempty"`
+	RateLimitPerSecond  int    `toml:"rate_limit_per_second,omitempty"`
+	RateLimitBurst      int    `toml:"rate_limit_burst,omitempty"`
+	CommunityIDSeed     uint16 `toml:"community_id_seed,omitempty"` // optional; 0 = default per Community ID v1 spec
+	// CaptureClientHello records the raw TLS ClientHello on each connection
+	// as tls.client.hello_hex. Every fingerprint derived from a hello is
+	// lossy, so keeping the record is what lets a fingerprint be checked,
+	// recomputed or replaced later. Default on; set false to save space.
+	CaptureClientHello *bool      `toml:"capture_client_hello,omitempty"`
+	Loom               LoomConfig `toml:"loom,omitempty"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -56,6 +61,16 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	return &config, nil
+}
+
+// ShouldCaptureClientHello defaults to true: a honeypot exists to record what
+// arrived, and the hello is the only copy of the cipher order, extension order
+// and GREASE placement that every fingerprint discards.
+func (c *Config) ShouldCaptureClientHello() bool {
+	if c.CaptureClientHello == nil {
+		return true
+	}
+	return *c.CaptureClientHello
 }
 
 // IsTLSEnabled returns true if both certificate and key paths are configured

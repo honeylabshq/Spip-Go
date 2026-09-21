@@ -138,6 +138,7 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 	var tlsClientNotAfter int64
 	var tlsJA4 string
 	var tlsJA3 string
+	var tlsHelloHex string
 	var tlsSupportedProtocols []string
 	if h.tlsHandler != nil {
 		var clientHello tls.ClientHelloInfo
@@ -187,6 +188,9 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 				stream = tls.NewTLSStream(wrappedConn)
 				tlsJA4 = clientHello.JA4
 				tlsJA3 = clientHello.JA3
+				if len(clientHello.HelloRaw) > 0 {
+					tlsHelloHex = hex.EncodeToString(clientHello.HelloRaw)
+				}
 				tlsSupportedProtocols = clientHello.SupportedProtocols
 			} else {
 				stream = tls.NewPlainStream(wrappedConn)
@@ -328,6 +332,7 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 			TLSSupportedProtocols: tlsSupportedProtocols,
 			TLSJA4:                tlsJA4,
 			TLSJA3:                tlsJA3,
+			TLSClientHelloHex:     tlsHelloHex,
 			SSHHassh:              sshHassh,
 			DurationMs:            time.Since(connStart).Milliseconds(),
 			BytesIn:               bytesIn,

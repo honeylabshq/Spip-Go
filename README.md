@@ -112,6 +112,7 @@ Spip can add passive fingerprinting fields to each connection record (ECS-compat
 
 - **Community ID** (`network.community_id`) — v1 flow hash of the 5-tuple (source/dest IP and port, protocol). When traffic is redirected via iptables, Spip uses the **original destination** (before REDIRECT) so the hash matches what other tools (e.g. Zeek, Suricata) would compute for the same flow.
 - **TLS** — From the ClientHello: `tls.client.server_name` (SNI), `tls.client.supported_protocols` (ALPN list), `tls.client.hash.ja4` (JA4 fingerprint).
+- **Raw ClientHello** — `tls.client.hello_hex` holds the handshake record exactly as it arrived, header included. Every fingerprint above is derived from these bytes and each one discards something: JA4 sorts the extension list, JA3 keeps its order, and neither keeps GREASE placement or the extension bodies. Keeping the record is what lets you check a fingerprint, recompute it after a bug, or compute a scheme that did not exist when the traffic was captured. A hello is a few hundred bytes; capture stops at 16 KiB per connection. Set `capture_client_hello = false` to turn it off.
 - **SSH** — When the payload starts with `SSH-2.0-` and contains a KEXINIT: `ssh.client.hash.hassh` (Hassh).
 
 All of these are additive; existing behaviour (local log, Loom, payload hex, HTTP parsing) is unchanged.
