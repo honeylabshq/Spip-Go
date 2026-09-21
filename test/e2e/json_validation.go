@@ -31,7 +31,6 @@ type LogEntry struct {
 	TLSServerName         string   `json:"tls_server_name,omitempty"`
 	TLSSupportedProtocols []string `json:"tls_supported_protocols,omitempty"`
 	TLSJA4                string   `json:"tls_ja4,omitempty"`
-	HTTPFP              string   `json:"http_fp,omitempty"`
 	SSHHassh              string   `json:"ssh_hassh,omitempty"`
 }
 
@@ -204,17 +203,6 @@ func ParseLogLine(line string) (*LogEntry, error) {
 					if s, ok := p.(string); ok {
 						entry.TLSSupportedProtocols = append(entry.TLSSupportedProtocols, s)
 					}
-				}
-			}
-		}
-	}
-
-	// http.request.hash.http_fp
-	if httpObj, ok := m["http"].(map[string]interface{}); ok {
-		if req, ok := httpObj["request"].(map[string]interface{}); ok {
-			if hash, ok := req["hash"].(map[string]interface{}); ok {
-				if http_fp, ok := hash["http_fp"].(string); ok {
-					entry.HTTPFP = http_fp
 				}
 			}
 		}

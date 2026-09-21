@@ -83,7 +83,7 @@ Spip emits each connection as a single JSON object. The output is formatted to b
 - `user_agent.original` — when available
 - `event.summary` — raw payload for non-HTTP probes
 - `event.original_payload_hex` — raw payload hex (always preserved)
-- [Fingerprinting](#fingerprinting) (built-in) adds `network.community_id`, `tls.client.*`, `http.request.hash.http_fp`, `ssh.client.hash.hassh` when applicable.
+- [Fingerprinting](#fingerprinting) (built-in) adds `network.community_id`, `tls.client.*`, `ssh.client.hash.hassh` when applicable.
 
 Example (ECS-shaped) record produced by Spip:
 ```json
@@ -111,7 +111,6 @@ Spip can add passive fingerprinting fields to each connection record (ECS-compat
 
 - **Community ID** (`network.community_id`) — v1 flow hash of the 5-tuple (source/dest IP and port, protocol). When traffic is redirected via iptables, Spip uses the **original destination** (before REDIRECT) so the hash matches what other tools (e.g. Zeek, Suricata) would compute for the same flow.
 - **TLS** — From the ClientHello: `tls.client.server_name` (SNI), `tls.client.supported_protocols` (ALPN list), `tls.client.hash.ja4` (JA4 fingerprint).
-- **HTTP** — From the first request: `http.request.hash.http_fp` (HTTP request fingerprint).
 - **SSH** — When the payload starts with `SSH-2.0-` and contains a KEXINIT: `ssh.client.hash.hassh` (Hassh).
 
 All of these are additive; existing behaviour (local log, Loom, payload hex, HTTP parsing) is unchanged.

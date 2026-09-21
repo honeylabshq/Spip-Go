@@ -360,24 +360,6 @@ func TestTCPConnection(t *testing.T) {
 		t.Error("Did not find expected payload in JSON output")
 	}
 
-	// Fingerprinting: at least one HTTP log line should have an HTTP request fingerprint (we already did HTTP request above)
-	var foundHTTPFP bool
-	for _, line := range strings.Split(output, "\n") {
-		if line == "" {
-			continue
-		}
-		entry, err := ParseLogLine(line)
-		if err != nil {
-			continue
-		}
-		if entry.HTTPFP != "" {
-			foundHTTPFP = true
-			break
-		}
-	}
-	if !foundHTTPFP {
-		t.Error("expected http.request.hash.http_fp to be set for HTTP request")
-	}
 }
 
 func TestTLSConnection(t *testing.T) {
