@@ -10,8 +10,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
-
-	"spip/internal/fingerprint"
 )
 
 // LogLevel represents the severity of a log message
@@ -60,7 +58,6 @@ type ConnectionData struct {
 	TLSSupportedProtocols []string `json:"tls_supported_protocols,omitempty"` // tls.client.supported_protocols (ALPN list from ClientHello)
 	TLSJA4                string   `json:"tls_ja4,omitempty"`                 // tls.client.hash.ja4
 	TLSJA3                string   `json:"tls_ja3,omitempty"`                 // tls.client.ja3 (legacy MD5 fingerprint)
-	HTTPJA4H              string   `json:"http_ja4h,omitempty"`               // http.request.hash.ja4h
 	SSHHassh              string   `json:"ssh_hassh,omitempty"`               // ssh.client.hash.hassh
 
 	// Behavioral metadata (cumulative within the session up to this record)
@@ -237,16 +234,11 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 			if m := httpReqLineRe.FindStringSubmatch(reqLine); m != nil {
 				method := m[1]
 				path := m[2]
-				version := ""
-				if len(m) > 3 {
-					version = m[3]
-				}
 
 				// Check for header terminator or Host header presence
 				hasTerminator := strings.Contains(payload, "\r\n\r\n")
 				hasHost := false
 				headers := map[string]string{}
-				headerNamesInOrder := []string{}
 				bodyStartIndex := -1
 
 				// Walk lines after request-line to collect headers until blank line
@@ -269,7 +261,6 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 						value := strings.TrimSpace(ln[idx+1:])
 						if name != "" {
 							headers[strings.ToLower(name)] = value
-							headerNamesInOrder = append(headerNamesInOrder, name)
 						}
 					}
 				}
@@ -285,13 +276,6 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 					reqObj := map[string]interface{}{"method": method}
 					if len(headers) > 0 {
 						reqObj["headers"] = headers
-					}
-					// JA4H: method, version, header order, cookie/referer/lang
-					ja4h := fingerprint.JA4H(method, version, headerNamesInOrder,
-						headers["cookie"] != "", headers["referer"] != "",
-						headers["accept-language"])
-					if ja4h != "" {
-						reqObj["hash"] = map[string]interface{}{"ja4h": ja4h}
 					}
 					httpObj["request"] = reqObj
 
