@@ -69,8 +69,9 @@ func main() {
 	var tlsHandler *tls.TLSHandler
 	if cfg.IsTLSEnabled() {
 		tlsHandler, err = tls.NewTLSHandler(&tls.Config{
-			CertPath: cfg.CertPath,
-			KeyPath:  cfg.KeyPath,
+			CertPath:           cfg.CertPath,
+			KeyPath:            cfg.KeyPath,
+			CaptureClientHello: cfg.ShouldCaptureClientHello(),
 		})
 		if err != nil {
 			logger.Error("main", fmt.Sprintf("Failed to initialize TLS: %v", err))

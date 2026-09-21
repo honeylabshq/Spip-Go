@@ -58,6 +58,7 @@ type ConnectionData struct {
 	TLSSupportedProtocols []string `json:"tls_supported_protocols,omitempty"` // tls.client.supported_protocols (ALPN list from ClientHello)
 	TLSJA4                string   `json:"tls_ja4,omitempty"`                 // tls.client.hash.ja4
 	TLSJA3                string   `json:"tls_ja3,omitempty"`                 // tls.client.ja3 (legacy MD5 fingerprint)
+	TLSClientHelloHex     string   `json:"tls_client_hello_hex,omitempty"`    // tls.client.hello_hex (raw ClientHello record)
 	SSHHassh              string   `json:"ssh_hassh,omitempty"`               // ssh.client.hash.hassh
 
 	// Behavioral metadata (cumulative within the session up to this record)
@@ -185,6 +186,14 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 		}
 		if data.TLSJA3 != "" {
 			tlsClient["ja3"] = data.TLSJA3 // ECS tls.client.ja3 (legacy MD5 fingerprint)
+		}
+		// The ClientHello exactly as it arrived, header included. Not an ECS
+		// field: it is an extension in the same spirit as
+		// event.original_payload_hex. Every fingerprint above is derived from
+		// these bytes and each one discards something, so this is what lets a
+		// consumer verify them or compute a different one later.
+		if data.TLSClientHelloHex != "" {
+			tlsClient["hello_hex"] = data.TLSClientHelloHex
 		}
 		if data.TLSVersion != "" {
 			tlsClient["version"] = data.TLSVersion

@@ -13,11 +13,15 @@ import (
 type Config struct {
 	CertPath string
 	KeyPath  string
+	// CaptureClientHello keeps the raw ClientHello on each TLS connection.
+	// Off leaves HelloRaw nil and changes nothing else.
+	CaptureClientHello bool
 }
 
 // TLSHandler handles TLS connections
 type TLSHandler struct {
-	config *tls.Config
+	config       *tls.Config
+	captureHello bool
 }
 
 // NewTLSHandler creates a new TLS handler
@@ -49,7 +53,7 @@ func NewTLSHandler(cfg *Config) (*TLSHandler, error) {
 		},
 	}
 
-	return &TLSHandler{config: config}, nil
+	return &TLSHandler{config: config, captureHello: cfg.CaptureClientHello}, nil
 }
 
 // IsTLSHandshake checks if the connection starts with a TLS handshake
@@ -69,6 +73,59 @@ type ClientHelloInfo struct {
 	JA4                string   // JA4 fingerprint string
 	JA3                string   // JA3 fingerprint (MD5 hash) — legacy, still keyed by most TI feeds
 	SupportedProtocols []string // ALPN protocols advertised by client (tls.client.supported_protocols)
+
+	// HelloRaw is the ClientHello record exactly as it arrived, header
+	// included. It is kept because every fingerprint above is lossy and
+	// throwing the input away makes them impossible to check or replace:
+	// JA4 sorts the extension list, JA3 keeps its order, and neither keeps
+	// GREASE placement or the extension bodies. A sensor that stores only
+	// its own conclusions cannot answer a question nobody asked yet.
+	//
+	// nil when capture is disabled or the record was not fully read.
+	HelloRaw []byte
+}
+
+// MaxClientHelloBytes bounds what a single peer can make us keep. A real
+// ClientHello is a few hundred bytes; 16 KiB is the TLS record ceiling, so
+// this accepts every legitimate hello and refuses to grow with a hostile one.
+const MaxClientHelloBytes = 16 * 1024
+
+// helloRecorder copies everything read from the peer into buf so the raw
+// ClientHello survives the fingerprinter consuming it. The fingerprinter
+// reads through a bufio.Reader, which may pull more than the record, so what
+// is recorded here is trimmed to the record length by clientHelloRecord.
+type helloRecorder struct {
+	net.Conn
+	buf []byte
+}
+
+func (c *helloRecorder) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 && len(c.buf) < MaxClientHelloBytes {
+		room := MaxClientHelloBytes - len(c.buf)
+		if n < room {
+			room = n
+		}
+		c.buf = append(c.buf, p[:room]...)
+	}
+	return n, err
+}
+
+// clientHelloRecord trims recorded bytes to exactly one TLS record: a 5-byte
+// header whose last two bytes give the payload length. Returns nil unless the
+// whole record is present, so a partial read is never stored as if it were a
+// complete hello.
+func clientHelloRecord(b []byte) []byte {
+	if len(b) < 5 || b[0] != 0x16 {
+		return nil
+	}
+	total := 5 + int(b[3])<<8 | int(b[4])
+	if total < 5 || total > len(b) {
+		return nil
+	}
+	out := make([]byte, total)
+	copy(out, b[:total])
+	return out
 }
 
 // prefixConn implements net.Conn by serving a prefix buffer first, then the underlying Conn.
@@ -100,7 +157,14 @@ func (h *TLSHandler) WrapConnection(conn net.Conn, out *ClientHelloInfo) (net.Co
 	}
 	connWithPrefix := &prefixConn{prefix: buf, Conn: conn}
 
-	fp, replayConn, err := tlsfingerprint.FingerprintConn(connWithPrefix)
+	var src net.Conn = connWithPrefix
+	var rec *helloRecorder
+	if h.captureHello {
+		rec = &helloRecorder{Conn: connWithPrefix}
+		src = rec
+	}
+
+	fp, replayConn, err := tlsfingerprint.FingerprintConn(src)
 	if err != nil {
 		return nil, true, fmt.Errorf("TLS ClientHello fingerprint: %w", err)
 	}
@@ -108,6 +172,9 @@ func (h *TLSHandler) WrapConnection(conn net.Conn, out *ClientHelloInfo) (net.Co
 		out.JA4 = fp.JA4String()
 		out.JA3 = fp.JA3Hash()
 		out.SupportedProtocols = fp.ALPNProtocols
+		if rec != nil {
+			out.HelloRaw = clientHelloRecord(rec.buf)
+		}
 	}
 
 	tlsConn := tls.Server(replayConn, h.config)
