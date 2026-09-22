@@ -102,6 +102,7 @@ func main() {
 
 	// Create network handler (community_id_seed from config, 0 = default)
 	handler := network.NewHandler(logger, tlsHandler, ratePerSec, burst, readTimeout, writeTimeout, cfg.Name, cfg.CommunityIDSeed)
+	handler.SetIgnoredNets(cfg.IgnoredNets())
 
 	// Create TCP listener
 	addr := fmt.Sprintf("%s:%d", cfg.IP, cfg.Port)
@@ -117,6 +118,19 @@ func main() {
 	// Accept connections and handle graceful shutdown on signals
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	// Periodically report what the drop list suppressed. Dropped traffic
+	// leaves no event behind, so without this a rule that stopped matching and
+	// a genuinely quiet network look the same in the data.
+	if len(cfg.IgnoredNets()) > 0 {
+		dropTicker := time.NewTicker(time.Hour)
+		defer dropTicker.Stop()
+		go func() {
+			for range dropTicker.C {
+				handler.ReportDrops()
+			}
+		}()
+	}
 
 	go func() {
 		for {
@@ -146,6 +160,10 @@ func main() {
 
 	// Wait for shutdown signal
 	<-stop
+
+	// One last accounting before exit, so a restart does not lose the record
+	// of what this run dropped.
+	handler.ReportDrops()
 	fmt.Fprintln(os.Stderr, "Shutdown signal received, closing listener")
 	listener.Close()
 

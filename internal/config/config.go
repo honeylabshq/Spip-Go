@@ -2,8 +2,10 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -36,8 +38,66 @@ type Config struct {
 	// as tls.client.hello_hex. Every fingerprint derived from a hello is
 	// lossy, so keeping the record is what lets a fingerprint be checked,
 	// recomputed or replaced later. Default on; set false to save space.
-	CaptureClientHello *bool      `toml:"capture_client_hello,omitempty"`
-	Loom               LoomConfig `toml:"loom,omitempty"`
+	CaptureClientHello *bool `toml:"capture_client_hello,omitempty"`
+	// IgnoreSources drops connections from these addresses or networks before
+	// anything is read, logged or shipped. A honeypot on a rented host is
+	// polled by that host's own monitoring, and those scrapes are not attacks:
+	// counted, they distort port rankings, scanner counts and fingerprint
+	// populations, and they cost storage and bandwidth for records nobody
+	// wants. Accepts bare addresses ("192.0.2.10") and CIDR ("192.0.2.0/24"),
+	// IPv4 or IPv6.
+	IgnoreSources []string   `toml:"ignore_sources,omitempty"`
+	Loom          LoomConfig `toml:"loom,omitempty"`
+
+	ignoreNets []netip.Prefix
+}
+
+// IgnoredNets returns the parsed ignore list.
+func (c *Config) IgnoredNets() []netip.Prefix { return c.ignoreNets }
+
+// ShouldIgnore reports whether traffic from addr must be dropped unrecorded.
+func (c *Config) ShouldIgnore(addr netip.Addr) bool {
+	if len(c.ignoreNets) == 0 {
+		return false
+	}
+	// A v4-mapped v6 address and its dotted form are the same host, so compare
+	// on the unmapped value rather than letting the representation decide.
+	addr = addr.Unmap()
+	for _, n := range c.ignoreNets {
+		if n.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseIgnoreSources turns the configured strings into prefixes. A bare
+// address becomes a single-host prefix. An unparsable entry is an error rather
+// than a silent skip: a typo here means traffic you believe is dropped is
+// being recorded.
+func parseIgnoreSources(entries []string) ([]netip.Prefix, error) {
+	out := make([]netip.Prefix, 0, len(entries))
+	for _, raw := range entries {
+		e := strings.TrimSpace(raw)
+		if e == "" {
+			continue
+		}
+		if strings.Contains(e, "/") {
+			p, err := netip.ParsePrefix(e)
+			if err != nil {
+				return nil, fmt.Errorf("ignore_sources: %q is not a valid network: %w", e, err)
+			}
+			out = append(out, netip.PrefixFrom(p.Addr().Unmap(), p.Bits()))
+			continue
+		}
+		a, err := netip.ParseAddr(e)
+		if err != nil {
+			return nil, fmt.Errorf("ignore_sources: %q is not a valid address: %w", e, err)
+		}
+		a = a.Unmap()
+		out = append(out, netip.PrefixFrom(a, a.BitLen()))
+	}
+	return out, nil
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -59,6 +119,12 @@ func LoadConfig(path string) (*Config, error) {
 	if config.KeyPath != "" && !filepath.IsAbs(config.KeyPath) {
 		config.KeyPath = filepath.Join(configDir, config.KeyPath)
 	}
+
+	nets, err := parseIgnoreSources(config.IgnoreSources)
+	if err != nil {
+		return nil, err
+	}
+	config.ignoreNets = nets
 
 	return &config, nil
 }
