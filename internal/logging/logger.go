@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/honeylabshq/akin"
 )
 
 // LogLevel represents the severity of a log message
@@ -285,6 +287,16 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 					reqObj := map[string]interface{}{"method": method}
 					if len(headers) > 0 {
 						reqObj["headers"] = headers
+					}
+					// Akin fingerprints the client from the raw request head.
+					// The token carries a header presence bitmap rather than a
+					// hash, so the distance between two of them is the number
+					// of headers the two clients differ by. The session section
+					// is left off: at the time a record is written the
+					// connection may still receive more requests, and a client
+					// must not change fingerprint mid-connection.
+					if fp := akin.Fingerprint([]byte(payload)); fp != "" {
+						reqObj["hash"] = map[string]interface{}{"akin": fp}
 					}
 					httpObj["request"] = reqObj
 
