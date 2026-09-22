@@ -3,6 +3,7 @@ package network
 import (
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 )
 
@@ -36,5 +37,53 @@ func TestHandlerShouldIgnore(t *testing.T) {
 	// net.ParseIP returns 16-byte v4-mapped values; the check must still match.
 	if !h.shouldIgnore(net.ParseIP("185.228.82.243").To16()) {
 		t.Error("a v4-mapped address of a listed host must be dropped")
+	}
+}
+
+// A counter nobody checks is the same failure as no counter at all, so the
+// accounting is tested rather than assumed.
+func TestDropAccounting(t *testing.T) {
+	h := &Handler{}
+	h.SetIgnoredNets([]netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")})
+
+	total, per := h.DropStats()
+	if total != 0 || len(per) != 0 {
+		t.Fatalf("a fresh handler must have dropped nothing, got %d %v", total, per)
+	}
+
+	for i := 0; i < 3; i++ {
+		h.countDrop("10.0.0.1")
+	}
+	h.countDrop("10.0.0.2")
+
+	total, per = h.DropStats()
+	if total != 4 {
+		t.Errorf("total = %d, want 4", total)
+	}
+	if per["10.0.0.1"] != 3 {
+		t.Errorf("10.0.0.1 = %d, want 3", per["10.0.0.1"])
+	}
+	if per["10.0.0.2"] != 1 {
+		t.Errorf("10.0.0.2 = %d, want 1", per["10.0.0.2"])
+	}
+}
+
+// Concurrent accepts are the normal case, so the counters must survive them.
+func TestDropAccountingIsConcurrencySafe(t *testing.T) {
+	h := &Handler{}
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				h.countDrop("203.0.113.5")
+			}
+		}()
+	}
+	wg.Wait()
+	total, per := h.DropStats()
+	if total != 5000 || per["203.0.113.5"] != 5000 {
+		t.Errorf("total=%d per=%d, want 5000 each", total, per["203.0.113.5"])
 	}
 }

@@ -119,6 +119,19 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
+	// Periodically report what the drop list suppressed. Dropped traffic
+	// leaves no event behind, so without this a rule that stopped matching and
+	// a genuinely quiet network look the same in the data.
+	if len(cfg.IgnoredNets()) > 0 {
+		dropTicker := time.NewTicker(time.Hour)
+		defer dropTicker.Stop()
+		go func() {
+			for range dropTicker.C {
+				handler.ReportDrops()
+			}
+		}()
+	}
+
 	go func() {
 		for {
 			conn, err := listener.Accept()
@@ -147,6 +160,10 @@ func main() {
 
 	// Wait for shutdown signal
 	<-stop
+
+	// One last accounting before exit, so a restart does not lose the record
+	// of what this run dropped.
+	handler.ReportDrops()
 	fmt.Fprintln(os.Stderr, "Shutdown signal received, closing listener")
 	listener.Close()
 
