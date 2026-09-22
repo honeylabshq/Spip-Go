@@ -6,7 +6,11 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"net/netip"
+	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"spip/internal/fingerprint"
@@ -28,6 +32,78 @@ type Handler struct {
 	writeTimeout    time.Duration
 	name            string
 	communityIDSeed uint16
+	ignoreNets      []netip.Prefix
+
+	// Dropped traffic leaves no event behind, which is the point of it and
+	// also the problem with it: a rule that stops matching, or one that
+	// matches far more than intended, looks identical to a quiet network.
+	// These counters are what makes the drop list auditable.
+	dropped     atomic.Uint64
+	droppedByIP sync.Map // string -> *atomic.Uint64
+}
+
+// SetIgnoredNets installs the drop list. Traffic from these networks is closed
+// before it is read, so it is never logged, fingerprinted or shipped.
+func (h *Handler) SetIgnoredNets(nets []netip.Prefix) { h.ignoreNets = nets }
+
+// DropStats returns the total dropped connections and the per-source counts
+// since start. Callers must not retain the map.
+func (h *Handler) DropStats() (uint64, map[string]uint64) {
+	per := make(map[string]uint64)
+	h.droppedByIP.Range(func(k, v any) bool {
+		per[k.(string)] = v.(*atomic.Uint64).Load()
+		return true
+	})
+	return h.dropped.Load(), per
+}
+
+// ReportDrops logs what the drop list actually suppressed. Called on a timer
+// and once at shutdown, so a silent sensor can still be told apart from a
+// sensor whose rules stopped matching.
+func (h *Handler) ReportDrops() {
+	total, per := h.DropStats()
+	if total == 0 {
+		if len(h.ignoreNets) > 0 {
+			h.logger.Info("network", fmt.Sprintf(
+				"ignore_sources: %d rule(s) configured, 0 connections dropped so far",
+				len(h.ignoreNets)))
+		}
+		return
+	}
+	parts := make([]string, 0, len(per))
+	for ip, n := range per {
+		parts = append(parts, fmt.Sprintf("%s=%d", ip, n))
+	}
+	sort.Strings(parts)
+	h.logger.Info("network", fmt.Sprintf(
+		"ignore_sources: dropped %d connections since start (%s)",
+		total, strings.Join(parts, " ")))
+}
+
+func (h *Handler) countDrop(ip string) {
+	h.dropped.Add(1)
+	c, ok := h.droppedByIP.Load(ip)
+	if !ok {
+		c, _ = h.droppedByIP.LoadOrStore(ip, &atomic.Uint64{})
+	}
+	c.(*atomic.Uint64).Add(1)
+}
+
+func (h *Handler) shouldIgnore(ip net.IP) bool {
+	if len(h.ignoreNets) == 0 {
+		return false
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, n := range h.ignoreNets {
+		if n.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // NewHandler creates a new network handler.
@@ -104,6 +180,24 @@ func handleHTTPRequest(data []byte, sourceIP string) []byte {
 func (h *Handler) HandleConnection(conn *net.TCPConn) {
 	conn.SetKeepAlive(true)
 	conn.SetKeepAlivePeriod(60 * time.Second)
+
+	// The drop list is checked before the rate limiter on purpose. Ignored
+	// traffic is, by definition, traffic this sensor does not want, and the
+	// volume that makes it worth ignoring is exactly the volume that would
+	// exhaust the limiter: on one sensor it was 98.7% of all connections, so
+	// real attacker traffic was being rejected to make room for a monitoring
+	// scraper. Dropping first means the limiter only ever sees traffic worth
+	// keeping.
+	if ra, ok := conn.RemoteAddr().(*net.TCPAddr); ok && h.shouldIgnore(ra.IP) {
+		// Nothing is read, so nothing is logged, fingerprinted or shipped: this
+		// is the difference between hiding traffic from readers and not
+		// recording it at all. Counted rather than logged per connection,
+		// because the traffic this exists for arrives thousands of times an
+		// hour and a line each would be its own noise problem.
+		h.countDrop(ra.IP.String())
+		conn.Close()
+		return
+	}
 
 	if !h.limiter.Allow() {
 		h.logger.Error("network", "Connection rejected due to rate limiting")
