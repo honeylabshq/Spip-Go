@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -28,6 +29,28 @@ type Handler struct {
 	writeTimeout    time.Duration
 	name            string
 	communityIDSeed uint16
+	ignoreNets      []netip.Prefix
+}
+
+// SetIgnoredNets installs the drop list. Traffic from these networks is closed
+// before it is read, so it is never logged, fingerprinted or shipped.
+func (h *Handler) SetIgnoredNets(nets []netip.Prefix) { h.ignoreNets = nets }
+
+func (h *Handler) shouldIgnore(ip net.IP) bool {
+	if len(h.ignoreNets) == 0 {
+		return false
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, n := range h.ignoreNets {
+		if n.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // NewHandler creates a new network handler.
@@ -107,6 +130,14 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 
 	if !h.limiter.Allow() {
 		h.logger.Error("network", "Connection rejected due to rate limiting")
+		conn.Close()
+		return
+	}
+
+	if ra, ok := conn.RemoteAddr().(*net.TCPAddr); ok && h.shouldIgnore(ra.IP) {
+		// Configured drop. Nothing is read, so nothing is logged, fingerprinted
+		// or shipped: this is the difference between hiding traffic from
+		// readers and not recording it at all.
 		conn.Close()
 		return
 	}

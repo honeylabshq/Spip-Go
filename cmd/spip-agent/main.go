@@ -102,6 +102,7 @@ func main() {
 
 	// Create network handler (community_id_seed from config, 0 = default)
 	handler := network.NewHandler(logger, tlsHandler, ratePerSec, burst, readTimeout, writeTimeout, cfg.Name, cfg.CommunityIDSeed)
+	handler.SetIgnoredNets(cfg.IgnoredNets())
 
 	// Create TCP listener
 	addr := fmt.Sprintf("%s:%d", cfg.IP, cfg.Port)
