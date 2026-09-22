@@ -84,7 +84,7 @@ Spip emits each connection as a single JSON object. The output is formatted to b
 - `user_agent.original` — when available
 - `event.summary` — raw payload for non-HTTP probes
 - `event.original_payload_hex` — raw payload hex (always preserved)
-- [Fingerprinting](#fingerprinting) (built-in) adds `network.community_id`, `tls.client.*`, `ssh.client.hash.hassh` when applicable.
+- [Fingerprinting](#fingerprinting) (built-in) adds `network.community_id`, `tls.client.*`, `ssh.client.hash.hassh`, `http.request.hash.akin` when applicable.
 
 Example (ECS-shaped) record produced by Spip:
 ```json
@@ -114,6 +114,7 @@ Spip can add passive fingerprinting fields to each connection record (ECS-compat
 - **TLS** — From the ClientHello: `tls.client.server_name` (SNI), `tls.client.supported_protocols` (ALPN list), `tls.client.hash.ja4` (JA4 fingerprint).
 - **Raw ClientHello** — `tls.client.hello_hex` holds the handshake record exactly as it arrived, header included. Every fingerprint above is derived from these bytes and each one discards something: JA4 sorts the extension list, JA3 keeps its order, and neither keeps GREASE placement or the extension bodies. Keeping the record is what lets you check a fingerprint, recompute it after a bug, or compute a scheme that did not exist when the traffic was captured. A hello is a few hundred bytes; capture stops at 16 KiB per connection. Set `capture_client_hello = false` to turn it off.
 - **SSH** — When the payload starts with `SSH-2.0-` and contains a KEXINIT: `ssh.client.hash.hassh` (Hassh).
+- **HTTP** - From the request head: `http.request.hash.akin` (Akin). The token carries a header presence bitmap rather than a hash, so the number of bits two tokens differ by is the number of headers the two clients differ by. Scanners that rotate their User-Agent keep one fingerprint, because neither the User-Agent value nor the request path is part of it.
 
 All of these are additive; existing behaviour (local log, Loom, payload hex, HTTP parsing) is unchanged.
 
@@ -121,6 +122,7 @@ All of these are additive; existing behaviour (local log, Loom, payload hex, HTT
 Community ID: [Corelight Community ID spec](https://github.com/corelight/community-id-spec).  
 JA4: [FoxIO JA4](https://github.com/FoxIO-LLC/ja4).  
 Hassh: [Salesforce HASSH](https://github.com/salesforce/hassh).  
+Akin: [honeylabshq/akin](https://github.com/honeylabshq/akin).  
 TLS fingerprinting uses [github.com/psanford/tlsfingerprint](https://github.com/psanford/tlsfingerprint) (MIT).
 
 ## Loom (optional log shipping)

@@ -32,6 +32,7 @@ type LogEntry struct {
 	TLSSupportedProtocols []string `json:"tls_supported_protocols,omitempty"`
 	TLSJA4                string   `json:"tls_ja4,omitempty"`
 	SSHHassh              string   `json:"ssh_hassh,omitempty"`
+	HTTPAkin              string   `json:"http_akin,omitempty"`
 }
 
 // ValidateLogEntry validates a single log entry against expected values
@@ -214,6 +215,17 @@ func ParseLogLine(line string) (*LogEntry, error) {
 			if hash, ok := client["hash"].(map[string]interface{}); ok {
 				if hassh, ok := hash["hassh"].(string); ok {
 					entry.SSHHassh = hassh
+				}
+			}
+		}
+	}
+
+	// http.request.hash.akin
+	if httpObj, ok := m["http"].(map[string]interface{}); ok {
+		if req, ok := httpObj["request"].(map[string]interface{}); ok {
+			if hash, ok := req["hash"].(map[string]interface{}); ok {
+				if fp, ok := hash["akin"].(string); ok {
+					entry.HTTPAkin = fp
 				}
 			}
 		}
