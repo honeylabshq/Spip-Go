@@ -9,8 +9,10 @@ import (
 	"bytes"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/honeylabshq/akin"
 	"io"
 	"net"
 	"net/http"
@@ -358,6 +360,35 @@ func TestTCPConnection(t *testing.T) {
 
 	if !foundPayload {
 		t.Error("Did not find expected payload in JSON output")
+	}
+
+	// The HTTP request made above must carry an Akin fingerprint, and it must
+	// be the fingerprint of the bytes that were actually logged. Pinning an
+	// exact token here would pin Go's own http client headers instead.
+	var checked bool
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		entry, err := ParseLogLine(line)
+		if err != nil || entry.HTTPAkin == "" {
+			continue
+		}
+		raw, err := hex.DecodeString(entry.PayloadHex)
+		if err != nil {
+			t.Fatalf("decode logged payload: %v", err)
+		}
+		if want := akin.Fingerprint(raw); entry.HTTPAkin != want {
+			t.Errorf("http.request.hash.akin = %q, want %q for the logged payload", entry.HTTPAkin, want)
+		}
+		if len(entry.HTTPAkin) != 27 {
+			t.Errorf("malformed akin token %q", entry.HTTPAkin)
+		}
+		checked = true
+		break
+	}
+	if !checked {
+		t.Error("expected http.request.hash.akin to be set for the HTTP request")
 	}
 
 }
