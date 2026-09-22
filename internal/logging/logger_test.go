@@ -1,6 +1,8 @@
 package logging
 
 import (
+	"github.com/honeylabshq/akin"
+
 	"bytes"
 	"encoding/json"
 	"io"
@@ -277,13 +279,23 @@ func TestLogConnection_Fingerprinting(t *testing.T) {
 		t.Fatal("missing tls object")
 	}
 
-	// http.request carries no hash field.
+	// http.request.hash.akin
 	if httpObj, ok := logged["http"].(map[string]interface{}); ok {
-		if req, ok := httpObj["request"].(map[string]interface{}); ok {
-			if _, ok := req["hash"]; ok {
-				t.Error("http.request.hash should not be emitted")
-			}
+		req, _ := httpObj["request"].(map[string]interface{})
+		if req == nil {
+			t.Fatal("missing http.request")
 		}
+		hash, ok := req["hash"].(map[string]interface{})
+		if !ok {
+			t.Fatal("missing http.request.hash")
+		}
+		// Pinned against the akin package's own vectors: "GET / HTTP/1.1"
+		// with a single Host header.
+		if got, _ := hash["akin"].(string); got != "a11cun010_00000008_c4b2c4aa" {
+			t.Errorf("http.request.hash.akin = %q, want %q", got, "a11cun010_00000008_c4b2c4aa")
+		}
+	} else {
+		t.Fatal("missing http object")
 	}
 
 	// ssh.client.hash.hassh
@@ -525,5 +537,76 @@ func TestLogConnection_HostHeaderIPv6(t *testing.T) {
 				t.Errorf("url.port = %d, want %d", gotPort, tc.wantPort)
 			}
 		})
+	}
+}
+
+// TestLogConnection_AkinDistance covers the property the fingerprint exists
+// for: two clients differing by one header must produce tokens one apart, and
+// a non-HTTP payload must produce no hash at all.
+func TestLogConnection_AkinDistance(t *testing.T) {
+	emit := func(t *testing.T, payload string) map[string]interface{} {
+		t.Helper()
+		tmpFile, err := os.CreateTemp("", "spip-akin-test")
+		if err != nil {
+			t.Fatalf("create temp file: %v", err)
+		}
+		defer os.Remove(tmpFile.Name())
+		defer tmpFile.Close()
+
+		logger := NewLogger(tmpFile)
+		if err := logger.LogConnection(&ConnectionData{
+			Timestamp:       time.Now().Unix(),
+			Payload:         payload,
+			SourceIP:        "10.0.0.1",
+			SourcePort:      40000,
+			DestinationIP:   "10.0.0.2",
+			DestinationPort: 80,
+			SessionID:       "akin-session",
+		}); err != nil {
+			t.Fatalf("LogConnection: %v", err)
+		}
+		if _, err := tmpFile.Seek(0, 0); err != nil {
+			t.Fatalf("Seek: %v", err)
+		}
+		var logged map[string]interface{}
+		if err := json.NewDecoder(tmpFile).Decode(&logged); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return logged
+	}
+
+	hashOf := func(t *testing.T, logged map[string]interface{}) string {
+		t.Helper()
+		httpObj, _ := logged["http"].(map[string]interface{})
+		if httpObj == nil {
+			return ""
+		}
+		req, _ := httpObj["request"].(map[string]interface{})
+		if req == nil {
+			return ""
+		}
+		hash, _ := req["hash"].(map[string]interface{})
+		if hash == nil {
+			return ""
+		}
+		got, _ := hash["akin"].(string)
+		return got
+	}
+
+	base := hashOf(t, emit(t, "GET / HTTP/1.1\r\nHost: a\r\nAccept: */*\r\n\r\n"))
+	plus := hashOf(t, emit(t, "GET / HTTP/1.1\r\nHost: a\r\nAccept: */*\r\nAccept-Encoding: gzip\r\n\r\n"))
+	if base == "" || plus == "" {
+		t.Fatalf("missing fingerprints: base=%q plus=%q", base, plus)
+	}
+	if base == plus {
+		t.Error("an extra header must change the fingerprint")
+	}
+	if d := akin.Distance(base, plus); d != 1 {
+		t.Errorf("akin.Distance = %d, want 1 (%s vs %s)", d, base, plus)
+	}
+
+	// A payload that is not an HTTP request carries no http object at all.
+	if got := hashOf(t, emit(t, "SSH-2.0-OpenSSH_9.6\r\n")); got != "" {
+		t.Errorf("non-HTTP payload produced a fingerprint: %q", got)
 	}
 }
