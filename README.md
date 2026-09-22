@@ -41,6 +41,8 @@ Optional configuration keys:
 - `read_timeout_seconds` / `write_timeout_seconds` — connection timeouts
 - `rate_limit_per_second` / `rate_limit_burst` — connection rate-limiting
 - `community_id_seed` — optional 16-bit seed for Community ID v1 flow hashing (omit or `0` for default)
+- `ignore_sources` - addresses or networks whose connections are closed before anything is read, so they are never logged, fingerprinted or shipped. Bare addresses and CIDR, IPv4 or IPv6:
+  `ignore_sources = ["192.0.2.10", "198.51.100.0/24", "2001:db8::/32"]`. A honeypot on a rented host gets polled by that host's own monitoring, and those scrapes are not attacks: counted, they distort port rankings and scanner counts, and they cost storage for records nobody wants. An entry that does not parse stops the agent starting, because a typo here silently records traffic you believe is dropped.
 
 If these runtime tuning fields are omitted or set to `0`, Spip applies the following defaults:
 - `read_timeout_seconds`: 30
