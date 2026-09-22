@@ -181,19 +181,26 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 	conn.SetKeepAlive(true)
 	conn.SetKeepAlivePeriod(60 * time.Second)
 
-	if !h.limiter.Allow() {
-		h.logger.Error("network", "Connection rejected due to rate limiting")
+	// The drop list is checked before the rate limiter on purpose. Ignored
+	// traffic is, by definition, traffic this sensor does not want, and the
+	// volume that makes it worth ignoring is exactly the volume that would
+	// exhaust the limiter: on one sensor it was 98.7% of all connections, so
+	// real attacker traffic was being rejected to make room for a monitoring
+	// scraper. Dropping first means the limiter only ever sees traffic worth
+	// keeping.
+	if ra, ok := conn.RemoteAddr().(*net.TCPAddr); ok && h.shouldIgnore(ra.IP) {
+		// Nothing is read, so nothing is logged, fingerprinted or shipped: this
+		// is the difference between hiding traffic from readers and not
+		// recording it at all. Counted rather than logged per connection,
+		// because the traffic this exists for arrives thousands of times an
+		// hour and a line each would be its own noise problem.
+		h.countDrop(ra.IP.String())
 		conn.Close()
 		return
 	}
 
-	if ra, ok := conn.RemoteAddr().(*net.TCPAddr); ok && h.shouldIgnore(ra.IP) {
-		// Configured drop. Nothing is read, so nothing is logged, fingerprinted
-		// or shipped: this is the difference between hiding traffic from
-		// readers and not recording it at all. Counted rather than logged per
-		// connection, because the traffic this exists for arrives thousands of
-		// times an hour and a line each would be its own noise problem.
-		h.countDrop(ra.IP.String())
+	if !h.limiter.Allow() {
+		h.logger.Error("network", "Connection rejected due to rate limiting")
 		conn.Close()
 		return
 	}
