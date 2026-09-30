@@ -9,4 +9,4 @@ require (
 	golang.org/x/time v0.15.0
 )
 
-require github.com/honeylabshq/akin v0.1.0
+require github.com/honeylabshq/akin v0.2.0
