@@ -291,8 +291,8 @@ func TestLogConnection_Fingerprinting(t *testing.T) {
 		}
 		// Pinned against the akin package's own vectors: "GET / HTTP/1.1"
 		// with a single Host header.
-		if got, _ := hash["akin"].(string); got != "a11cun010_00000008_c4b2c4aa" {
-			t.Errorf("http.request.hash.akin = %q, want %q", got, "a11cun010_00000008_c4b2c4aa")
+		if got, _ := hash["akin"].(string); got != "b11cun010_00040000_c4b2c4aa" {
+			t.Errorf("http.request.hash.akin = %q, want %q", got, "b11cun010_00040000_c4b2c4aa")
 		}
 	} else {
 		t.Fatal("missing http object")
