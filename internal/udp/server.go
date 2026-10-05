@@ -20,6 +20,7 @@ import (
 	"spip/internal/fingerprint"
 	"spip/internal/logging"
 	"spip/internal/quic"
+	"spip/pkg/conntrack"
 	"spip/pkg/socket"
 
 	"github.com/google/uuid"
@@ -70,13 +71,20 @@ type Server struct {
 	asm     *quic.Assembler
 	now     func() time.Time
 
-	dropped      atomic.Uint64
-	droppedByIP  sync.Map // string -> *atomic.Uint64
-	limited      atomic.Uint64
-	sourceLimit  atomic.Uint64
-	noOrigDst    atomic.Uint64
-	ctResolved   atomic.Uint64
-	ctMissing    atomic.Uint64
+	dropped     atomic.Uint64
+	droppedByIP sync.Map // string -> *atomic.Uint64
+	limited     atomic.Uint64
+	sourceLimit atomic.Uint64
+	noOrigDst   atomic.Uint64
+	ctResolved  atomic.Uint64
+	ctMissing   atomic.Uint64
+	ctPaused    atomic.Uint64
+
+	// listenPort is the socket's own port. A datagram addressed to it was
+	// delivered by REDIRECT (or genuinely sent to that port) and is resolved
+	// through conntrack. Zero disables resolution.
+	listenPort   atomic.Int32
+	ct           ctBreaker
 	kernelDrops  atomic.Uint32
 	panics       atomic.Uint64
 	lastPanicLog atomic.Int64
@@ -121,6 +129,9 @@ func (s *Server) Serve(conn *net.UDPConn) error {
 	go s.sweep()
 
 	local, _ := conn.LocalAddr().(*net.UDPAddr)
+	if local != nil {
+		s.listenPort.Store(int32(local.Port))
+	}
 	buf := make([]byte, MaxDatagram)
 	oob := make([]byte, controlMessageBuffer)
 	for {
@@ -150,9 +161,6 @@ func (s *Server) Serve(conn *net.UDPConn) error {
 				dst = &socket.OriginalDst{IP: local.IP, Port: uint16(local.Port)}
 			}
 		}
-		if local != nil && int(dst.Port) == local.Port && s.opt.Conntrack != nil {
-			dst = s.redirected(src, dst)
-		}
 		s.HandleDatagram(append([]byte(nil), buf[:n]...), src, dst)
 	}
 }
@@ -160,22 +168,62 @@ func (s *Server) Serve(conn *net.UDPConn) error {
 // redirected returns the destination the sender used for a datagram that
 // arrived addressed to the listener itself. Under REDIRECT that is every
 // datagram; under TPROXY only a genuine probe to the listener's port, for
-// which conntrack returns the same port.
-func (s *Server) redirected(src *net.UDPAddr, dst *socket.OriginalDst) *socket.OriginalDst {
+// which conntrack returns the same port. On any failure the listener's own
+// address is kept, so the datagram is still recorded.
+func (s *Server) redirected(src *net.UDPAddr, dst *socket.OriginalDst, now time.Time) *socket.OriginalDst {
 	remote, ok1 := netip.AddrFromSlice(src.IP)
 	local, ok2 := netip.AddrFromSlice(dst.IP)
 	if !ok1 || !ok2 || local.Unmap().IsUnspecified() {
 		s.ctMissing.Add(1)
 		return dst
 	}
+	if !s.ct.allow(now) {
+		s.ctPaused.Add(1)
+		return dst
+	}
 	orig, err := s.opt.Conntrack.OriginalDst(17,
 		netip.AddrPortFrom(remote.Unmap(), uint16(src.Port)), netip.AddrPortFrom(local.Unmap(), dst.Port))
+	s.ct.record(now, err)
 	if err != nil {
 		s.ctMissing.Add(1)
 		return dst
 	}
 	s.ctResolved.Add(1)
 	return &socket.OriginalDst{IP: orig.Addr().AsSlice(), Port: orig.Port()}
+}
+
+// ctBreaker stops conntrack lookups for a while after consecutive failures
+// that are not a plain "no such entry", so a stuck netlink socket costs a
+// few timeouts rather than one per datagram.
+type ctBreaker struct {
+	mu          sync.Mutex
+	streak      int
+	pausedUntil time.Time
+}
+
+const (
+	ctFailuresBeforePause = 3
+	ctPause               = 30 * time.Second
+)
+
+func (b *ctBreaker) allow(now time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return !now.Before(b.pausedUntil)
+}
+
+func (b *ctBreaker) record(now time.Time, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err == nil || errors.Is(err, conntrack.ErrNotFound) {
+		b.streak = 0
+		return
+	}
+	b.streak++
+	if b.streak >= ctFailuresBeforePause {
+		b.streak = 0
+		b.pausedUntil = now.Add(ctPause)
+	}
 }
 
 // Shutdown stops the sweeper and records QUIC attempts still pending.
@@ -226,6 +274,11 @@ func (s *Server) HandleDatagram(payload []byte, src *net.UDPAddr, dst *socket.Or
 	if !s.limiter.AllowN(now, 1) {
 		s.limited.Add(1)
 		return
+	}
+	// Resolved only after the drop list and both rate limits, so a flood
+	// costs no conntrack round trips beyond what the limits admit.
+	if p := s.listenPort.Load(); p != 0 && int32(dst.Port) == p && s.opt.Conntrack != nil {
+		dst = s.redirected(src, dst, now)
 	}
 
 	if s.handleQUIC(payload, src, dst, now) {
@@ -430,6 +483,7 @@ func (s *Server) Report() {
 	add(s.noOrigDst.Load(), "datagrams without TPROXY destination")
 	add(s.ctResolved.Load(), "redirected datagrams resolved through conntrack")
 	add(s.ctMissing.Load(), "redirected datagrams conntrack could not resolve")
+	add(s.ctPaused.Load(), "redirected datagrams recorded unresolved while conntrack lookups were paused")
 	add(s.panics.Load(), "handler panics recovered")
 	if len(parts) > 0 {
 		s.logger.Info("udp", "since start: "+strings.Join(parts, "; "))

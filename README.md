@@ -113,9 +113,9 @@ Note: the agent only emits fields it can derive from the connection payload and 
 Spip can add passive fingerprinting fields to each connection record (ECS-compatible, no change to payload capture):
 
 - **Community ID** (`network.community_id`): v1 flow hash of the 5-tuple (source/dest IP and port, protocol). When traffic is redirected via iptables, Spip uses the **original destination** (before REDIRECT) so the hash matches what other tools (e.g. Zeek, Suricata) would compute for the same flow.
-- **TLS**: from the ClientHello: `tls.client.server_name` (SNI), `tls.client.supported_protocols` (ALPN list), `tls.client.hash.ja4` (JA4 fingerprint).
+- **TLS**: `tls.client.server_name` (SNI), `tls.client.supported_protocols` (ALPN list) and `tls.client.hash.ja4` (JA4 fingerprint), all read from the ClientHello.
 - **Raw ClientHello**: `tls.client.hello_hex` holds the handshake record exactly as it arrived, header included. Every fingerprint above is derived from these bytes and each one discards something: JA4 sorts the extension list, JA3 keeps its order, and neither keeps GREASE placement or the extension bodies. Keeping the record is what lets you check a fingerprint, recompute it after a bug, or compute a scheme that did not exist when the traffic was captured. A hello is a few hundred bytes; capture stops at 16 KiB per connection. Set `capture_client_hello = false` to turn it off.
-- **SSH**: when the payload starts with `SSH-2.0-` and contains a KEXINIT: `ssh.client.hash.hassh` (Hassh).
+- **SSH**: `ssh.client.hash.hassh` (Hassh), when the payload starts with `SSH-2.0-` and contains a KEXINIT.
 - **HTTP** - From the request head: `http.request.hash.akin` (Akin). The token carries a presence map over a fixed list of headers and short codes for the rest, so the distance between two tokens is the number of headers the two clients differ by, and header order never changes it. Scanners that rotate their User-Agent keep one fingerprint, because neither the User-Agent value nor the request path is part of it.
 
 All of these are additive; existing behaviour (local log, Loom, payload hex, HTTP parsing) is unchanged.
@@ -146,7 +146,9 @@ A plain nat `REDIRECT`, the way the TCP side works, is not enough for UDP on its
 Spip supports two ways around that, and the capture script picks one automatically:
 
 - **TPROXY** (mangle table), used wherever the kernel has the target. The datagram reaches Spip's transparent socket unchanged and the socket reads the real destination. Needs `CAP_NET_ADMIN`; Spip runs as root on the sensors.
-- **REDIRECT with a conntrack lookup** (nat table), for hosts whose kernel exposes no TPROXY target, such as container platforms that share the host kernel and do not load the module. Spip asks conntrack over netlink for the flow whose reply direction matches the datagram it received, and takes the original destination from that entry. Needs read access to ctnetlink. In the lab both modes recorded identical destination ports for IPv4 and IPv6.
+- **REDIRECT with a conntrack lookup** (nat table), for kernels without a working TPROXY. Spip asks conntrack over netlink for the flow whose reply direction matches the datagram it received, and takes the original destination from that entry. Needs read access to ctnetlink. The lookup runs only after the drop list and rate limits have admitted a datagram, and pauses for 30 seconds after three failed lookups in a row, so a flood or a stuck netlink socket cannot stall the reader. In the lab both modes recorded identical destination ports for IPv4 and IPv6.
+
+The script picks REDIRECT inside an OpenVZ or Virtuozzo container and wherever the kernel refuses a TPROXY rule. Accepting the rule does not prove TPROXY delivers: an OpenVZ container accepts it and then passes nothing through. On other platforms, look at the first datagrams after `up`, and pin `MODE=redirect` if the TPROXY rule counts packets that never reach Spip.
 
 `scripts/udp-capture.sh` installs the rule. Run `print` first to see exactly what it will do:
 
