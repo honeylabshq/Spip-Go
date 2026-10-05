@@ -36,11 +36,11 @@ port = 8080
 ```
 
 Optional configuration keys:
-- `cert_path` / `key_path` — enable TLS if both set; may be relative to the config file (the setup script writes relative paths so the config works from any working directory)
+- `cert_path` / `key_path`: enable TLS if both set; may be relative to the config file (the setup script writes relative paths so the config works from any working directory)
 - **Log output:** `log_file` (local) and/or `[loom]` (remote). See [Log output](#log-output) below.
-- `read_timeout_seconds` / `write_timeout_seconds` — connection timeouts
-- `rate_limit_per_second` / `rate_limit_burst` — connection rate-limiting
-- `community_id_seed` — optional 16-bit seed for Community ID v1 flow hashing (omit or `0` for default)
+- `read_timeout_seconds` / `write_timeout_seconds`: connection timeouts
+- `rate_limit_per_second` / `rate_limit_burst`: connection rate-limiting
+- `community_id_seed`: optional 16-bit seed for Community ID v1 flow hashing (omit or `0` for default)
 - `ignore_sources` - addresses or networks whose connections are closed before anything is read, so they are never logged, fingerprinted or shipped. Bare addresses and CIDR, IPv4 or IPv6:
   `ignore_sources = ["192.0.2.10", "198.51.100.0/24", "2001:db8::/32"]`. A honeypot on a rented host gets polled by that host's own monitoring, and those scrapes are not attacks: counted, they distort port rankings and scanner counts, and they cost storage for records nobody wants. An entry that does not parse stops the agent starting, because a typo here silently records traffic you believe is dropped.
 
@@ -77,15 +77,15 @@ So: local defaults to stdout; override with `log_file` for a file. Optionally ad
 
 ## Log format
 Spip emits each connection as a single JSON object. The output is formatted to be ECS-compatible using only the fields Spip can provide (no ASN/geo enrichment). Typical fields produced include:
-- `@timestamp` — RFC3339 timestamp for the event
-- `event.id` — per-connection session identifier
-- `observer.hostname` / `host.name` — agent `name` from config
+- `@timestamp`: RFC3339 timestamp for the event
+- `event.id`: per-connection session identifier
+- `observer.hostname` / `host.name`: agent `name` from config
 - `source.ip`, `source.port` and `destination.ip`, `destination.port`
-- `network.transport` — e.g. `tcp`
-- `http.request.body` / `url.path` — when the payload clearly resembles HTTP
-- `user_agent.original` — when available
-- `event.summary` — raw payload for non-HTTP probes
-- `event.original_payload_hex` — raw payload hex (always preserved)
+- `network.transport`: e.g. `tcp`
+- `http.request.body` / `url.path`: when the payload clearly resembles HTTP
+- `user_agent.original`: when available
+- `event.summary`: raw payload for non-HTTP probes
+- `event.original_payload_hex`: raw payload hex (always preserved)
 - [Fingerprinting](#fingerprinting) (built-in) adds `network.community_id`, `tls.client.*`, `ssh.client.hash.hassh`, `http.request.hash.akin` when applicable.
 
 Example (ECS-shaped) record produced by Spip:
@@ -112,10 +112,10 @@ Note: the agent only emits fields it can derive from the connection payload and 
 
 Spip can add passive fingerprinting fields to each connection record (ECS-compatible, no change to payload capture):
 
-- **Community ID** (`network.community_id`) — v1 flow hash of the 5-tuple (source/dest IP and port, protocol). When traffic is redirected via iptables, Spip uses the **original destination** (before REDIRECT) so the hash matches what other tools (e.g. Zeek, Suricata) would compute for the same flow.
-- **TLS** — From the ClientHello: `tls.client.server_name` (SNI), `tls.client.supported_protocols` (ALPN list), `tls.client.hash.ja4` (JA4 fingerprint).
-- **Raw ClientHello** — `tls.client.hello_hex` holds the handshake record exactly as it arrived, header included. Every fingerprint above is derived from these bytes and each one discards something: JA4 sorts the extension list, JA3 keeps its order, and neither keeps GREASE placement or the extension bodies. Keeping the record is what lets you check a fingerprint, recompute it after a bug, or compute a scheme that did not exist when the traffic was captured. A hello is a few hundred bytes; capture stops at 16 KiB per connection. Set `capture_client_hello = false` to turn it off.
-- **SSH** — When the payload starts with `SSH-2.0-` and contains a KEXINIT: `ssh.client.hash.hassh` (Hassh).
+- **Community ID** (`network.community_id`): v1 flow hash of the 5-tuple (source/dest IP and port, protocol). When traffic is redirected via iptables, Spip uses the **original destination** (before REDIRECT) so the hash matches what other tools (e.g. Zeek, Suricata) would compute for the same flow.
+- **TLS**: from the ClientHello: `tls.client.server_name` (SNI), `tls.client.supported_protocols` (ALPN list), `tls.client.hash.ja4` (JA4 fingerprint).
+- **Raw ClientHello**: `tls.client.hello_hex` holds the handshake record exactly as it arrived, header included. Every fingerprint above is derived from these bytes and each one discards something: JA4 sorts the extension list, JA3 keeps its order, and neither keeps GREASE placement or the extension bodies. Keeping the record is what lets you check a fingerprint, recompute it after a bug, or compute a scheme that did not exist when the traffic was captured. A hello is a few hundred bytes; capture stops at 16 KiB per connection. Set `capture_client_hello = false` to turn it off.
+- **SSH**: when the payload starts with `SSH-2.0-` and contains a KEXINIT: `ssh.client.hash.hassh` (Hassh).
 - **HTTP** - From the request head: `http.request.hash.akin` (Akin). The token carries a presence map over a fixed list of headers and short codes for the rest, so the distance between two tokens is the number of headers the two clients differ by, and header order never changes it. Scanners that rotate their User-Agent keep one fingerprint, because neither the User-Agent value nor the request path is part of it.
 
 All of these are additive; existing behaviour (local log, Loom, payload hex, HTTP parsing) is unchanged.
@@ -141,17 +141,22 @@ Every UDP record carries `network.transport: udp` and a Community ID over protoc
 
 ### Host setup
 
-UDP needs a TPROXY rule, not the nat `REDIRECT` the TCP side uses. Under REDIRECT the kernel rewrites the destination before the socket sees it, and UDP has no `SO_ORIGINAL_DST`, so every event would carry Spip's own port. This was measured in a lab namespace: a datagram to port 53 arrived reporting port 7999. TPROXY delivers the datagram unchanged to Spip's transparent socket, which needs `CAP_NET_ADMIN` (Spip runs as root on the sensors).
+A plain nat `REDIRECT`, the way the TCP side works, is not enough for UDP on its own. The kernel rewrites the destination before the socket sees it, and UDP has no `SO_ORIGINAL_DST`, so every event would carry Spip's own port. This was measured in a lab namespace: a datagram to port 53 arrived reporting port 7999.
+
+Spip supports two ways around that, and the capture script picks one automatically:
+
+- **TPROXY** (mangle table), used wherever the kernel has the target. The datagram reaches Spip's transparent socket unchanged and the socket reads the real destination. Needs `CAP_NET_ADMIN`; Spip runs as root on the sensors.
+- **REDIRECT with a conntrack lookup** (nat table), for hosts whose kernel exposes no TPROXY target, such as container platforms that share the host kernel and do not load the module. Spip asks conntrack over netlink for the flow whose reply direction matches the datagram it received, and takes the original destination from that entry. Needs read access to ctnetlink. In the lab both modes recorded identical destination ports for IPv4 and IPv6.
 
 `scripts/udp-capture.sh` installs the rule. Run `print` first to see exactly what it will do:
 
 ```bash
 PORT=8080 ./scripts/udp-capture.sh print
-PORT=8080 ./scripts/udp-capture.sh up      # idempotent
+PORT=8080 ./scripts/udp-capture.sh up      # idempotent; MODE=tproxy or MODE=redirect to force one
 ./scripts/udp-capture.sh down
 ```
 
-The script leaves alone everything the host needs. It skips loopback, so local resolvers such as systemd-resolved on 127.0.0.53 keep working. It skips replies to the host's own traffic (conntrack ESTABLISHED), broadcast and multicast, and every port with a non-loopback UDP listener at install time, such as WireGuard, Tailscale and DHCP. Pass `EXEMPT="..."` for more. It adds no fwmark or routing table, because the honeypot addresses are already local. The usual TPROXY recipe with a mark and a local routing table fails on hosts with `src_valid_mark=1`, which WireGuard tooling sets: reverse-path filtering then drops every packet as martian.
+The script leaves alone everything the host needs. It skips loopback, so local resolvers such as systemd-resolved on 127.0.0.53 keep working. It skips replies to the host's own traffic (conntrack ESTABLISHED under TPROXY; under REDIRECT the nat table only sees new flows), broadcast and multicast, and every port with a non-loopback UDP listener at install time, read from `/proc/net/udp*`, such as WireGuard, Tailscale and DHCP. Pass `EXEMPT="..."` for more. It adds no fwmark or routing table, because the honeypot addresses are already local. The usual TPROXY recipe with a mark and a local routing table fails on hosts with `src_valid_mark=1`, which WireGuard tooling sets: reverse-path filtering then drops every packet as martian.
 
 Every input is treated as hostile. A global limit (`udp_rate_limit_per_second`, default 50, `udp_rate_limit_burst`, default 500) sits behind a per-source limit (`udp_source_rate_limit_per_second`, default 5, `udp_source_rate_limit_burst`, default 20) keyed by IPv4 address or IPv6 /64, so one sender cannot spend the whole budget. At most 2 KB of each datagram is stored, while `source.bytes` keeps its real size. Pending QUIC attempts are capped at 1024 of 8 KB each. Attacker-supplied text (DNS names, ALPN values, close reasons) is escaped to printable ASCII. Drops, limits, kernel receive-buffer overflows (`SO_RXQ_OVFL`) and folded QUIC retransmissions are reported hourly and at shutdown.
 

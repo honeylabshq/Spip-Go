@@ -16,6 +16,7 @@ import (
 	"spip/internal/network"
 	"spip/internal/tls"
 	"spip/internal/udp"
+	"spip/pkg/conntrack"
 	"spip/pkg/socket"
 )
 
@@ -127,8 +128,16 @@ func main() {
 			logger.Error("main", fmt.Sprintf("UDP capture disabled, listen failed: %v", err))
 		} else {
 			udpConn = res.Conn
+			// Hosts without TPROXY deliver UDP with a nat REDIRECT, and the
+			// original destination then comes from conntrack.
+			ct, ctErr := conntrack.Open()
+			if ctErr != nil {
+				logger.Warn("main", fmt.Sprintf("conntrack unavailable, REDIRECT capture would lose destination ports: %v", ctErr))
+			} else {
+				defer ct.Close()
+			}
 			if !res.Transparent {
-				logger.Warn("main", "UDP socket is not transparent (needs CAP_NET_ADMIN); TPROXY rules cannot deliver to it")
+				logger.Warn("main", "UDP socket is not transparent (needs CAP_NET_ADMIN); only REDIRECT capture can deliver to it")
 			}
 			udpServer = udp.NewServer(logger, udp.Options{
 				Name:               cfg.Name,
@@ -139,13 +148,14 @@ func main() {
 				Burst:              cfg.UDPRateLimitBurst,
 				SourceRate:         float64(cfg.UDPSourceRateLimitPerSecond),
 				SourceBurst:        cfg.UDPSourceRateLimitBurst,
+				Conntrack:          resolver(ct),
 			})
 			go func() {
 				if err := udpServer.Serve(udpConn); err != nil {
 					logger.Error("main", fmt.Sprintf("UDP capture stopped: %v", err))
 				}
 			}()
-			fmt.Fprintf(os.Stderr, "UDP capture on %s (transparent=%v)\n", udpAddr, res.Transparent)
+			fmt.Fprintf(os.Stderr, "UDP capture on %s (transparent=%v, conntrack=%v)\n", udpAddr, res.Transparent, ct != nil)
 		}
 	}
 
@@ -217,4 +227,12 @@ func main() {
 	if loomShipper != nil {
 		loomShipper.Shutdown()
 	}
+}
+
+// resolver keeps a nil *conntrack.Client from becoming a non-nil interface.
+func resolver(c *conntrack.Client) udp.OriginalDstResolver {
+	if c == nil {
+		return nil
+	}
+	return c
 }

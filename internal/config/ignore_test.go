@@ -44,7 +44,7 @@ ignore_sources = ["203.0.113.16", "10.0.0.0/8", "2001:db8::/32"]
 		addr string
 		want bool
 	}{
-		{"203.0.113.16", true},  // the exact host
+		{"203.0.113.16", true},    // the exact host
 		{"185.228.82.244", false}, // its neighbour must not be caught
 		{"10.1.2.3", true},        // inside the v4 network
 		{"11.1.2.3", false},

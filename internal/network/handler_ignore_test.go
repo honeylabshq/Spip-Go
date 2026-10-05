@@ -22,7 +22,7 @@ func TestHandlerShouldIgnore(t *testing.T) {
 	})
 
 	cases := map[string]bool{
-		"203.0.113.16": true,
+		"203.0.113.16":   true,
 		"185.228.82.242": false,
 		"10.255.255.254": true,
 		"11.0.0.1":       false,
