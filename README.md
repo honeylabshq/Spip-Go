@@ -201,3 +201,10 @@ sudo ./scripts/initial_setup.sh
 ```
 The script prompts for: a short `name` (written into `config.toml`, used in logs as `observer.hostname` / `host.name`), listen IP and port, optional self-signed TLS cert generation (paths are written relative to the config so they work from any directory), optional Loom configuration (URL, sensor_id, token, batch_size, flush_interval, TLS verify), log file path, and optional iptables PREROUTING redirect.
 
+## License
+
+Business Source License 1.1, see [LICENSE](LICENSE).
+
+In plain terms: you may read, modify and redistribute the code, and run it in production for your own organization, for example to watch your own networks or for research and teaching. You may not use it, or data it collects or processes, to make money from third parties. Selling it, running it for customers, or selling feeds, reports or threat intelligence built on its data needs a commercial license, available from info@honeylabs.net. Four years after each version's first public release, that version becomes available under the Apache License 2.0.
+
+This summary is for convenience. The LICENSE file is what applies.

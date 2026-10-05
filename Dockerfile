@@ -10,4 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /work
 COPY . /work
 
-RUN go build -o spip-agent ./cmd/spip-agent || true
+ARG VERSION=dev
+LABEL org.opencontainers.image.licenses="BUSL-1.1" \
+      org.opencontainers.image.vendor="HoneyLabs" \
+      org.opencontainers.image.title="Spip"
+RUN go build -ldflags="-X main.version=${VERSION}" -o spip-agent ./cmd/spip-agent
