@@ -202,3 +202,17 @@ func TestIsTLSEnabled(t *testing.T) {
 		})
 	}
 }
+
+func TestUDPDefaults(t *testing.T) {
+	c := &Config{Port: 8080}
+	if c.UDPEnabled {
+		t.Fatal("UDP must be off unless configured")
+	}
+	if c.UDPListenPort() != 8080 {
+		t.Errorf("udp port defaults to %d, want the TCP port", c.UDPListenPort())
+	}
+	c.UDPPort = 9000
+	if c.UDPListenPort() != 9000 {
+		t.Errorf("explicit udp_port ignored")
+	}
+}
