@@ -20,7 +20,11 @@ import (
 	"spip/pkg/socket"
 )
 
+// version is set at build time: -ldflags "-X main.version=<version>".
+var version = "dev"
+
 func main() {
+	logging.Version = version
 	// Parse command line flags
 	configPath := flag.String("config", "config.toml", "Path to configuration file")
 	flag.Parse()

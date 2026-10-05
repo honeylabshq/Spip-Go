@@ -118,6 +118,10 @@ type FileLogger struct {
 	lastDropLog atomic.Int64 // unix seconds, rate-limits the WARN
 }
 
+// Version is the build's version, set by the agent at startup. It is
+// reported in observer.version and agent.version.
+var Version = "dev"
+
 var httpReqLineRe = regexp.MustCompile(`^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+(\S+)\s+(HTTP/1\.[01])$`)
 
 func NewLogger(output io.Writer) Logger {
@@ -149,10 +153,22 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 	// @timestamp in RFC3339 UTC
 	ecs["@timestamp"] = time.Unix(data.Timestamp, 0).UTC().Format(time.RFC3339Nano)
 
+	transport := data.Transport
+	if transport == "" {
+		transport = "tcp"
+	}
+
 	// event.id (shared across all records of a connection = the session key),
 	// plus behavioral metadata: event.sequence and event.duration (nanoseconds).
+	// module, dataset and the categorization fields let a SIEM select Spip's
+	// records with the standard ECS fields.
 	event := map[string]interface{}{
-		"id": data.SessionID,
+		"id":       data.SessionID,
+		"module":   "spip",
+		"dataset":  "spip." + transport,
+		"kind":     "event",
+		"category": []string{"network", "intrusion_detection"},
+		"type":     []string{"connection", "info"},
 	}
 	if data.RecordSeq > 0 {
 		event["sequence"] = data.RecordSeq
@@ -180,17 +196,23 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 	}
 	ecs["destination"] = destination
 
-	// observer and host hostname from agent name, if present (ECS fields)
-	if data.Name != "" {
-		ecs["observer"] = map[string]interface{}{"hostname": data.Name, "id": data.Name} // observer.hostname + observer.id
-		ecs["host"] = map[string]interface{}{"name": data.Name}                          // host.name
+	// observer: the product that captured the record, plus the sensor's
+	// configured name as observer.hostname / observer.id and host.name.
+	observer := map[string]interface{}{
+		"vendor":  "HoneyLabs",
+		"product": "Spip",
+		"type":    "honeypot",
+		"version": Version,
 	}
+	if data.Name != "" {
+		observer["hostname"] = data.Name
+		observer["id"] = data.Name
+		ecs["host"] = map[string]interface{}{"name": data.Name}
+	}
+	ecs["observer"] = observer
+	ecs["agent"] = map[string]interface{}{"type": "spip", "version": Version}
 
 	// network transport/protocol hints + Community ID
-	transport := data.Transport
-	if transport == "" {
-		transport = "tcp"
-	}
 	network := map[string]interface{}{"transport": transport}
 	if data.CommunityID != "" {
 		network["community_id"] = data.CommunityID

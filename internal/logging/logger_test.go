@@ -197,10 +197,48 @@ func TestLogConnection(t *testing.T) {
 		t.Errorf("payload_hex/event.original_payload_hex = %v, want %v", gotPayloadHex, connData.PayloadHex)
 	}
 
-	// observer / host name (if set) should match
-	if obs, ok := logged["observer"].(map[string]interface{}); ok {
-		if hn, _ := obs["hostname"].(string); hn == "" {
-			t.Errorf("observer.hostname is empty, expected value")
+	// observer.hostname carries the configured name, and only when one is set.
+	obs, _ := logged["observer"].(map[string]interface{})
+	if hn, _ := obs["hostname"].(string); hn != connData.Name {
+		t.Errorf("observer.hostname = %q, want %q", hn, connData.Name)
+	}
+}
+
+// Every record names the product that captured it in the standard ECS fields,
+// so a SIEM can select Spip's events without knowing its custom fields.
+func TestLogConnectionIdentifiesTheProduct(t *testing.T) {
+	old := Version
+	Version = "1.2.3"
+	defer func() { Version = old }()
+	for _, transport := range []string{"", "udp"} {
+		var buf bytes.Buffer
+		if err := NewLogger(&buf).LogConnection(&ConnectionData{
+			Timestamp: 1, SourceIP: "198.51.100.7", DestinationIP: "192.0.2.1",
+			Name: "sensor-a", Transport: transport,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]interface{}
+		if err := json.Unmarshal(buf.Bytes(), &m); err != nil {
+			t.Fatal(err)
+		}
+		obs := m["observer"].(map[string]interface{})
+		for k, want := range map[string]string{"vendor": "HoneyLabs", "product": "Spip", "type": "honeypot", "version": "1.2.3", "hostname": "sensor-a"} {
+			if obs[k] != want {
+				t.Errorf("observer.%s = %v, want %s", k, obs[k], want)
+			}
+		}
+		agent := m["agent"].(map[string]interface{})
+		if agent["type"] != "spip" || agent["version"] != "1.2.3" {
+			t.Errorf("agent = %v", agent)
+		}
+		ev := m["event"].(map[string]interface{})
+		wantDataset := "spip.tcp"
+		if transport == "udp" {
+			wantDataset = "spip.udp"
+		}
+		if ev["module"] != "spip" || ev["dataset"] != wantDataset || ev["kind"] != "event" || ev["ingested_by"] != "spip" {
+			t.Errorf("event = %v", ev)
 		}
 	}
 }
