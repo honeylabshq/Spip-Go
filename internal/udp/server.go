@@ -50,6 +50,15 @@ type Options struct {
 	Burst              int
 	SourceRate         float64
 	SourceBurst        int
+	// Conntrack recovers the original destination of datagrams that a nat
+	// REDIRECT delivered, on hosts that cannot use TPROXY. Optional.
+	Conntrack OriginalDstResolver
+}
+
+// OriginalDstResolver looks up where a sender addressed a flow that reached
+// local from remote.
+type OriginalDstResolver interface {
+	OriginalDst(proto uint8, remote, local netip.AddrPort) (netip.AddrPort, error)
 }
 
 // Server reads datagrams from one socket and logs them.
@@ -66,6 +75,8 @@ type Server struct {
 	limited      atomic.Uint64
 	sourceLimit  atomic.Uint64
 	noOrigDst    atomic.Uint64
+	ctResolved   atomic.Uint64
+	ctMissing    atomic.Uint64
 	kernelDrops  atomic.Uint32
 	panics       atomic.Uint64
 	lastPanicLog atomic.Int64
@@ -139,8 +150,32 @@ func (s *Server) Serve(conn *net.UDPConn) error {
 				dst = &socket.OriginalDst{IP: local.IP, Port: uint16(local.Port)}
 			}
 		}
+		if local != nil && int(dst.Port) == local.Port && s.opt.Conntrack != nil {
+			dst = s.redirected(src, dst)
+		}
 		s.HandleDatagram(append([]byte(nil), buf[:n]...), src, dst)
 	}
+}
+
+// redirected returns the destination the sender used for a datagram that
+// arrived addressed to the listener itself. Under REDIRECT that is every
+// datagram; under TPROXY only a genuine probe to the listener's port, for
+// which conntrack returns the same port.
+func (s *Server) redirected(src *net.UDPAddr, dst *socket.OriginalDst) *socket.OriginalDst {
+	remote, ok1 := netip.AddrFromSlice(src.IP)
+	local, ok2 := netip.AddrFromSlice(dst.IP)
+	if !ok1 || !ok2 || local.Unmap().IsUnspecified() {
+		s.ctMissing.Add(1)
+		return dst
+	}
+	orig, err := s.opt.Conntrack.OriginalDst(17,
+		netip.AddrPortFrom(remote.Unmap(), uint16(src.Port)), netip.AddrPortFrom(local.Unmap(), dst.Port))
+	if err != nil {
+		s.ctMissing.Add(1)
+		return dst
+	}
+	s.ctResolved.Add(1)
+	return &socket.OriginalDst{IP: orig.Addr().AsSlice(), Port: orig.Port()}
 }
 
 // Shutdown stops the sweeper and records QUIC attempts still pending.
@@ -393,6 +428,8 @@ func (s *Server) Report() {
 	add(overflow, "quic attempts refused at capacity")
 	add(retransmits, "quic retransmits folded")
 	add(s.noOrigDst.Load(), "datagrams without TPROXY destination")
+	add(s.ctResolved.Load(), "redirected datagrams resolved through conntrack")
+	add(s.ctMissing.Load(), "redirected datagrams conntrack could not resolve")
 	add(s.panics.Load(), "handler panics recovered")
 	if len(parts) > 0 {
 		s.logger.Info("udp", "since start: "+strings.Join(parts, "; "))
