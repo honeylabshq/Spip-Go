@@ -38,22 +38,17 @@ type LogMessage struct {
 // ConnectionData represents TCP connection data
 type ConnectionData struct {
 	// Name of the agent that produced this record (optional)
-	Name            string `json:"name,omitempty"`
-	Timestamp       int64  `json:"timestamp"`
-	Payload         string `json:"payload"`
-	PayloadHex      string `json:"payload_hex"`
-	SourceIP        string `json:"source_ip"`
-	SourcePort      uint16 `json:"source_port"`
-	DestinationIP   string `json:"destination_ip"`
-	DestinationPort uint16 `json:"destination_port"`
-	SessionID       string `json:"session_id"`
-	// Transport is "tcp" or "udp"; empty means tcp, which is every record
-	// written before UDP capture existed.
-	Transport string `json:"transport,omitempty"`
-	// NetworkProtocol names the application protocol when it is not derived
-	// from IsTLS: "dns" or "quic". It wins over the "tls" hint, because a QUIC
-	// handshake is TLS carried inside QUIC and the record should say QUIC.
-	NetworkProtocol    string        `json:"network_protocol,omitempty"`
+	Name               string        `json:"name,omitempty"`
+	Timestamp          int64         `json:"timestamp"`
+	Payload            string        `json:"payload"`
+	PayloadHex         string        `json:"payload_hex"`
+	SourceIP           string        `json:"source_ip"`
+	SourcePort         uint16        `json:"source_port"`
+	DestinationIP      string        `json:"destination_ip"`
+	DestinationPort    uint16        `json:"destination_port"`
+	SessionID          string        `json:"session_id"`
+	Transport          string        `json:"transport,omitempty"`        // "tcp" (default) or "udp"
+	NetworkProtocol    string        `json:"network_protocol,omitempty"` // "dns" or "quic"; overrides the tls hint
 	DNS                *dnsinfo.Info `json:"dns,omitempty"`
 	QUIC               *QUICData     `json:"quic,omitempty"`
 	IsTLS              bool          `json:"is_tls"`
@@ -81,24 +76,23 @@ type ConnectionData struct {
 	RecordSeq  int   `json:"record_seq,omitempty"`  // event.sequence — this record's index in the session (1-based)
 }
 
-// QUICData is what a capture-only sensor learns from a client's QUIC Initial
-// packets. There is no ECS namespace for QUIC, so these are written under
-// quic.* the same way hello_hex extends tls.client.
+// QUICData is what a client's Initial packets reveal. ECS has no QUIC
+// namespace, so it is written under quic.*.
 type QUICData struct {
-	Version       string // "1", "2", "draft-29", or the hex of an unknown version
-	DCID          string // hex
-	SCID          string // hex
+	Version       string
+	DCID          string
+	SCID          string
 	TokenLength   int
-	Datagrams     int  // Initial datagrams folded into this record (retransmits)
-	Decrypted     bool // false for versions without known Initial keys
-	HelloComplete bool // the whole ClientHello arrived
-	CryptoBytes   int  // contiguous handshake bytes received when incomplete
+	Datagrams     int
+	Decrypted     bool
+	HelloComplete bool
+	CryptoBytes   int
 	CloseReason   string
 
-	TransportParamsHash string // quic.client.transport_parameters.hash
-	TransportParamsStr  string // what the hash covers, for inspection
-	TransportParamsHex  string // raw extension body
-	UserAgent           string // Google user_agent transport parameter, when sent
+	TransportParamsHash string
+	TransportParamsStr  string
+	TransportParamsHex  string
+	UserAgent           string
 }
 
 // Logger defines the interface for logging operations
@@ -458,11 +452,10 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 	return l.writeJSON(ecs)
 }
 
-// dnsECS maps a decoded DNS message onto the ECS dns.* fields. EDNS has no
-// ECS field and goes under dns.edns.
+// dnsECS maps a decoded message onto ECS dns.*; EDNS goes under dns.edns.
 func dnsECS(d *dnsinfo.Info) map[string]interface{} {
 	out := map[string]interface{}{
-		"id":      strconv.Itoa(int(d.ID)), // ECS types dns.id as keyword
+		"id":      strconv.Itoa(int(d.ID)),
 		"op_code": d.OpCode,
 		"type":    "query",
 	}

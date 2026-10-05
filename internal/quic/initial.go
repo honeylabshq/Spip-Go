@@ -1,13 +1,7 @@
-// Package quic reads the client's first flight of a QUIC connection without
-// answering it.
-//
-// QUIC encrypts even its first packet, but the Initial packet keys are derived
-// from a public salt and the Destination Connection ID the client chose, so any
-// observer can recompute them (RFC 9001 section 5.2). That is deliberate in the
-// protocol: Initial protection guards against off-path tampering, not against
-// reading. A client sends its whole TLS ClientHello in CRYPTO frames inside its
-// Initial packets before the server says anything, so a capture-only sensor
-// sees the same handshake a full server would.
+// Package quic reads a client's QUIC Initial packets without answering them.
+// Initial keys derive from a public salt and the client's Destination
+// Connection ID (RFC 9001 section 5.2), so a passive receiver can decrypt the
+// first flight and recover the TLS ClientHello.
 package quic
 
 import (
@@ -16,13 +10,11 @@ import (
 	"crypto/hkdf"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 )
 
-// Versions this package can decrypt. Anything else still has its invariant
-// header parsed (RFC 8999) so a version-negotiation probe is recorded with the
-// version it tried.
 const (
 	Version1       uint32 = 0x00000001 // RFC 9000
 	Version2       uint32 = 0x6b3343cf // RFC 9369
@@ -32,25 +24,34 @@ const (
 type versionParams struct {
 	salt                       []byte
 	keyLabel, ivLabel, hpLabel string
-	initialType                byte // long-header type bits for Initial
+	initialType                byte
+	retryType                  byte
 }
 
 var versions = map[uint32]versionParams{
 	Version1: {
 		salt:     mustHex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a"),
 		keyLabel: "quic key", ivLabel: "quic iv", hpLabel: "quic hp",
-		initialType: 0,
+		initialType: 0, retryType: 3,
 	},
 	Version2: {
 		salt:     mustHex("0dede3def700a6db819381be6e269dcbf9bd2ed9"),
 		keyLabel: "quicv2 key", ivLabel: "quicv2 iv", hpLabel: "quicv2 hp",
-		initialType: 1,
+		initialType: 1, retryType: 0,
 	},
 	VersionDraft29: {
 		salt:     mustHex("afbfec289993d24c9e9786f19c6111e04390a899"),
 		keyLabel: "quic key", ivLabel: "quic iv", hpLabel: "quic hp",
-		initialType: 0,
+		initialType: 0, retryType: 3,
 	},
+}
+
+const maxConnIDLen = 20
+
+// Known reports whether Initial packets of version v can be decrypted.
+func Known(v uint32) bool {
+	_, ok := versions[v]
+	return ok
 }
 
 // VersionName is the label stored with each record.
@@ -62,21 +63,14 @@ func VersionName(v uint32) string {
 		return "2"
 	case VersionDraft29:
 		return "draft-29"
-	case 0:
-		return "negotiation"
 	}
 	return fmt.Sprintf("0x%08x", v)
 }
 
 var (
-	// ErrNotQUIC means the datagram does not start with a long header.
-	ErrNotQUIC = errors.New("not a QUIC long-header packet")
-	// ErrUnsupportedVersion means the header parsed but this package has no
-	// keys for the version. The returned Packet still carries the header.
+	ErrNotQUIC            = errors.New("not a QUIC long-header packet")
 	ErrUnsupportedVersion = errors.New("unsupported QUIC version")
-	// ErrNotInitial means a known version but a packet type other than Initial
-	// (0-RTT, Handshake or Retry), which a capture-only sensor cannot decrypt.
-	ErrNotInitial = errors.New("not an Initial packet")
+	ErrNotInitial         = errors.New("not an Initial packet")
 )
 
 // Keys are the client Initial packet protection keys for one connection.
@@ -84,8 +78,7 @@ type Keys struct {
 	Key, IV, HP []byte
 }
 
-// ClientInitialKeys derives the client's Initial keys from the Destination
-// Connection ID of its first packet (RFC 9001 section 5.2, RFC 9369 3.3).
+// ClientInitialKeys derives the client's Initial keys (RFC 9001 5.2, RFC 9369 3.3).
 func ClientInitialKeys(version uint32, dcid []byte) (*Keys, error) {
 	vp, ok := versions[version]
 	if !ok {
@@ -118,47 +111,38 @@ func expandLabel(secret []byte, label string, n int) ([]byte, error) {
 	info := make([]byte, 0, 4+len(full))
 	info = append(info, byte(n>>8), byte(n), byte(len(full)))
 	info = append(info, full...)
-	info = append(info, 0) // empty context
+	info = append(info, 0)
 	return hkdf.Expand(sha256.New, secret, string(info), n)
 }
 
-// Packet is one long-header packet from a datagram. Header fields are always
-// set when err is nil or ErrUnsupportedVersion/ErrNotInitial; Frames only when
-// the packet was an Initial that decrypted.
+// Packet is one long-header packet. Frames is set only for an Initial that
+// decrypted.
 type Packet struct {
 	Version  uint32
 	DCID     []byte
 	SCID     []byte
-	Type     byte // raw long-header type bits
+	Type     byte
 	TokenLen int
 	PN       uint64
 	Frames   *Frames
 }
 
-// ParseDatagram walks every coalesced long-header packet in a datagram and
-// returns them in order. A client's first datagram is normally one Initial
-// padded to 1200 bytes, but Initial plus 0-RTT coalescing is legal. The first
-// error that stops parsing is returned alongside whatever was parsed before it;
-// unsupported versions and non-Initial packets are reported per packet rather
-// than stopping the walk.
+// ParseDatagram returns the coalesced long-header packets of a datagram. A
+// packet of an unknown version, or one that fails to decrypt, is returned with
+// its header and the error that stopped the walk.
 func ParseDatagram(b []byte) ([]*Packet, error) {
 	var out []*Packet
-	for len(b) > 0 {
-		if b[0]&0x80 == 0 {
-			if len(out) == 0 {
-				return nil, ErrNotQUIC
-			}
-			break // a short-header packet or padding after the long ones
-		}
+	for len(b) > 0 && b[0]&0x80 != 0 {
 		p, n, err := parseLong(b)
-		if p != nil {
-			out = append(out, p)
+		if p == nil {
+			break
 		}
-		if err != nil && !errors.Is(err, ErrUnsupportedVersion) && !errors.Is(err, ErrNotInitial) {
+		out = append(out, p)
+		if err != nil && !errors.Is(err, ErrNotInitial) {
 			return out, err
 		}
-		if n <= 0 || errors.Is(err, ErrUnsupportedVersion) {
-			break // without keys the packet length field cannot be trusted
+		if n <= 0 {
+			break
 		}
 		b = b[n:]
 	}
@@ -168,24 +152,19 @@ func ParseDatagram(b []byte) ([]*Packet, error) {
 	return out, nil
 }
 
-// parseLong parses one long-header packet at the start of b and returns it with
-// the number of bytes it occupied.
 func parseLong(b []byte) (*Packet, int, error) {
 	if len(b) < 7 {
 		return nil, 0, ErrNotQUIC
 	}
-	p := &Packet{Version: binary.BigEndian.Uint32(b[1:5])}
+	p := &Packet{Version: binary.BigEndian.Uint32(b[1:5]), Type: (b[0] & 0x30) >> 4}
 	off := 5
 	dcil := int(b[off])
 	off++
-	if dcil > 255 || off+dcil > len(b) {
+	if off+dcil >= len(b) {
 		return nil, 0, ErrNotQUIC
 	}
 	p.DCID = append([]byte(nil), b[off:off+dcil]...)
 	off += dcil
-	if off >= len(b) {
-		return nil, 0, ErrNotQUIC
-	}
 	scil := int(b[off])
 	off++
 	if off+scil > len(b) {
@@ -193,30 +172,25 @@ func parseLong(b []byte) (*Packet, int, error) {
 	}
 	p.SCID = append([]byte(nil), b[off:off+scil]...)
 	off += scil
-	p.Type = (b[0] & 0x30) >> 4
 
 	vp, known := versions[p.Version]
 	if !known {
 		return p, 0, ErrUnsupportedVersion
 	}
-	if dcil > 20 || scil > 20 {
-		return nil, 0, fmt.Errorf("connection id longer than 20 bytes")
+	if dcil > maxConnIDLen || scil > maxConnIDLen {
+		return nil, 0, ErrNotQUIC
 	}
-
 	if p.Type != vp.initialType {
-		// Skip it if the length can be read: types other than Retry carry one.
-		return p, skipNonInitial(b, off, p, vp), ErrNotInitial
+		return p, skipLength(b, off, p.Type == vp.retryType), ErrNotInitial
 	}
 
-	// From here on the header is known, so failures return it with the error:
-	// the caller can still record a QUIC attempt that did not decrypt.
 	tokenLen, n, err := readVarint(b[off:])
 	if err != nil {
 		return p, 0, err
 	}
 	off += n
 	if tokenLen > uint64(len(b)-off) {
-		return p, 0, fmt.Errorf("token length beyond datagram")
+		return p, 0, errors.New("token length beyond datagram")
 	}
 	p.TokenLen = int(tokenLen)
 	off += int(tokenLen)
@@ -227,7 +201,7 @@ func parseLong(b []byte) (*Packet, int, error) {
 	}
 	off += n
 	pnOffset := off
-	if length > uint64(len(b)-pnOffset) || length < 20 {
+	if length < 20 || length > uint64(len(b)-pnOffset) {
 		return p, 0, fmt.Errorf("packet length %d does not fit datagram", length)
 	}
 	end := pnOffset + int(length)
@@ -241,48 +215,36 @@ func parseLong(b []byte) (*Packet, int, error) {
 		return p, 0, err
 	}
 	p.PN = pn
-	// A frame the spec does not allow in an Initial ends the parse, but the
-	// CRYPTO data read before it is real and authenticated, so it is kept.
-	fr, _ := parseFrames(plain)
-	p.Frames = fr
+	// CRYPTO data read before a disallowed frame is authenticated and kept.
+	p.Frames, _ = parseFrames(plain)
 	return p, end, nil
 }
 
-// skipNonInitial returns the size of a 0-RTT or Handshake packet so the walk
-// can continue past it, or 0 when it cannot tell.
-func skipNonInitial(b []byte, off int, p *Packet, vp versionParams) int {
-	retry := byte(3)
-	if p.Version == Version2 {
-		retry = 0
-	}
-	if p.Type == retry {
+// skipLength returns the size of a 0-RTT or Handshake packet, or 0 when it
+// cannot be determined (Retry carries no length).
+func skipLength(b []byte, off int, retry bool) int {
+	if retry {
 		return 0
 	}
 	length, n, err := readVarint(b[off:])
-	if err != nil {
+	if err != nil || length > uint64(len(b)-off-n) {
 		return 0
 	}
-	end := off + n + int(length)
-	if length > uint64(len(b)) || end > len(b) {
-		return 0
-	}
-	return end
+	return off + n + int(length)
 }
 
-// unprotect removes header protection and decrypts the payload of the packet
-// pkt, whose packet number starts at pnOffset. It works on a copy.
 func unprotect(pkt []byte, pnOffset int, k *Keys) ([]byte, uint64, error) {
-	if pnOffset+4+16 > len(pkt) {
-		return nil, 0, fmt.Errorf("packet too short for header protection sample")
+	if pnOffset+4+aes.BlockSize > len(pkt) {
+		return nil, 0, errors.New("packet too short for header protection sample")
 	}
 	hdr := append([]byte(nil), pkt...)
-	block, err := aes.NewCipher(k.HP)
+	hp, err := aes.NewCipher(k.HP)
 	if err != nil {
 		return nil, 0, err
 	}
-	mask := make([]byte, 16)
-	block.Encrypt(mask, hdr[pnOffset+4:pnOffset+4+16])
-	hdr[0] ^= mask[0] & 0x0f // long header: low four bits are protected
+	mask := make([]byte, aes.BlockSize)
+	hp.Encrypt(mask, hdr[pnOffset+4:pnOffset+4+aes.BlockSize])
+	hdr[0] ^= mask[0] & 0x0f
 	pnLen := int(hdr[0]&0x03) + 1
 	var pn uint64
 	for i := 0; i < pnLen; i++ {
@@ -290,11 +252,11 @@ func unprotect(pkt []byte, pnOffset int, k *Keys) ([]byte, uint64, error) {
 		pn = pn<<8 | uint64(hdr[pnOffset+i])
 	}
 
-	aesKey, err := aes.NewCipher(k.Key)
+	block, err := aes.NewCipher(k.Key)
 	if err != nil {
 		return nil, 0, err
 	}
-	aead, err := cipher.NewGCM(aesKey)
+	aead, err := cipher.NewGCM(block)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -313,11 +275,11 @@ func unprotect(pkt []byte, pnOffset int, k *Keys) ([]byte, uint64, error) {
 // readVarint decodes a QUIC variable-length integer (RFC 9000 section 16).
 func readVarint(b []byte) (uint64, int, error) {
 	if len(b) == 0 {
-		return 0, 0, fmt.Errorf("truncated varint")
+		return 0, 0, errors.New("truncated varint")
 	}
 	n := 1 << (b[0] >> 6)
 	if len(b) < n {
-		return 0, 0, fmt.Errorf("truncated varint")
+		return 0, 0, errors.New("truncated varint")
 	}
 	v := uint64(b[0] & 0x3f)
 	for i := 1; i < n; i++ {
@@ -327,19 +289,9 @@ func readVarint(b []byte) (uint64, int, error) {
 }
 
 func mustHex(s string) []byte {
-	out := make([]byte, len(s)/2)
-	for i := range out {
-		out[i] = unhex(s[2*i])<<4 | unhex(s[2*i+1])
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		panic(err)
 	}
-	return out
-}
-
-func unhex(c byte) byte {
-	switch {
-	case c >= '0' && c <= '9':
-		return c - '0'
-	case c >= 'a' && c <= 'f':
-		return c - 'a' + 10
-	}
-	panic("bad hex in constant")
+	return b
 }
