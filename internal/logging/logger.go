@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/honeylabshq/akin"
+
+	"spip/internal/dnsinfo"
 )
 
 // LogLevel represents the severity of a log message
@@ -36,24 +38,33 @@ type LogMessage struct {
 // ConnectionData represents TCP connection data
 type ConnectionData struct {
 	// Name of the agent that produced this record (optional)
-	Name               string `json:"name,omitempty"`
-	Timestamp          int64  `json:"timestamp"`
-	Payload            string `json:"payload"`
-	PayloadHex         string `json:"payload_hex"`
-	SourceIP           string `json:"source_ip"`
-	SourcePort         uint16 `json:"source_port"`
-	DestinationIP      string `json:"destination_ip"`
-	DestinationPort    uint16 `json:"destination_port"`
-	SessionID          string `json:"session_id"`
-	IsTLS              bool   `json:"is_tls"`
-	TLSALPN            string `json:"tls_alpn,omitempty"`
-	TLSServerName      string `json:"tls_server_name,omitempty"`
-	TLSVersion         string `json:"tls_version,omitempty"`
-	TLSCipherSuite     string `json:"tls_cipher_suite,omitempty"`
-	TLSClientSubject   string `json:"tls_client_subject,omitempty"`
-	TLSClientIssuer    string `json:"tls_client_issuer,omitempty"`
-	TLSClientNotBefore int64  `json:"tls_client_not_before,omitempty"`
-	TLSClientNotAfter  int64  `json:"tls_client_not_after,omitempty"`
+	Name            string `json:"name,omitempty"`
+	Timestamp       int64  `json:"timestamp"`
+	Payload         string `json:"payload"`
+	PayloadHex      string `json:"payload_hex"`
+	SourceIP        string `json:"source_ip"`
+	SourcePort      uint16 `json:"source_port"`
+	DestinationIP   string `json:"destination_ip"`
+	DestinationPort uint16 `json:"destination_port"`
+	SessionID       string `json:"session_id"`
+	// Transport is "tcp" or "udp"; empty means tcp, which is every record
+	// written before UDP capture existed.
+	Transport string `json:"transport,omitempty"`
+	// NetworkProtocol names the application protocol when it is not derived
+	// from IsTLS: "dns" or "quic". It wins over the "tls" hint, because a QUIC
+	// handshake is TLS carried inside QUIC and the record should say QUIC.
+	NetworkProtocol    string        `json:"network_protocol,omitempty"`
+	DNS                *dnsinfo.Info `json:"dns,omitempty"`
+	QUIC               *QUICData     `json:"quic,omitempty"`
+	IsTLS              bool          `json:"is_tls"`
+	TLSALPN            string        `json:"tls_alpn,omitempty"`
+	TLSServerName      string        `json:"tls_server_name,omitempty"`
+	TLSVersion         string        `json:"tls_version,omitempty"`
+	TLSCipherSuite     string        `json:"tls_cipher_suite,omitempty"`
+	TLSClientSubject   string        `json:"tls_client_subject,omitempty"`
+	TLSClientIssuer    string        `json:"tls_client_issuer,omitempty"`
+	TLSClientNotBefore int64         `json:"tls_client_not_before,omitempty"`
+	TLSClientNotAfter  int64         `json:"tls_client_not_after,omitempty"`
 
 	// Fingerprinting (ECS)
 	CommunityID           string   `json:"community_id,omitempty"`            // network.community_id
@@ -68,6 +79,26 @@ type ConnectionData struct {
 	BytesIn    int64 `json:"bytes_in,omitempty"`    // source.bytes captured so far
 	BytesOut   int64 `json:"bytes_out,omitempty"`   // destination.bytes sent so far
 	RecordSeq  int   `json:"record_seq,omitempty"`  // event.sequence — this record's index in the session (1-based)
+}
+
+// QUICData is what a capture-only sensor learns from a client's QUIC Initial
+// packets. There is no ECS namespace for QUIC, so these are written under
+// quic.* the same way hello_hex extends tls.client.
+type QUICData struct {
+	Version       string // "1", "2", "draft-29", or the hex of an unknown version
+	DCID          string // hex
+	SCID          string // hex
+	TokenLength   int
+	Datagrams     int  // Initial datagrams folded into this record (retransmits)
+	Decrypted     bool // false for versions without known Initial keys
+	HelloComplete bool // the whole ClientHello arrived
+	CryptoBytes   int  // contiguous handshake bytes received when incomplete
+	CloseReason   string
+
+	TransportParamsHash string // quic.client.transport_parameters.hash
+	TransportParamsStr  string // what the hash covers, for inspection
+	TransportParamsHex  string // raw extension body
+	UserAgent           string // Google user_agent transport parameter, when sent
 }
 
 // Logger defines the interface for logging operations
@@ -161,12 +192,19 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 		ecs["host"] = map[string]interface{}{"name": data.Name}                          // host.name
 	}
 
-	// network transport/protocol hints (derived from IsTLS) + Community ID
-	network := map[string]interface{}{"transport": "tcp"}
+	// network transport/protocol hints + Community ID
+	transport := data.Transport
+	if transport == "" {
+		transport = "tcp"
+	}
+	network := map[string]interface{}{"transport": transport}
 	if data.CommunityID != "" {
 		network["community_id"] = data.CommunityID
 	}
-	if data.IsTLS {
+	switch {
+	case data.NetworkProtocol != "":
+		network["protocol"] = data.NetworkProtocol
+	case data.IsTLS:
 		network["protocol"] = "tls"
 	}
 	if data.BytesIn > 0 || data.BytesOut > 0 {
@@ -359,6 +397,18 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 		}
 	}
 
+	if data.DNS != nil {
+		ecs["dns"] = dnsECS(data.DNS)
+	}
+	if data.QUIC != nil {
+		ecs["quic"] = quicECS(data.QUIC)
+		if data.QUIC.UserAgent != "" {
+			if _, ok := ecs["user_agent"]; !ok {
+				ecs["user_agent"] = map[string]interface{}{"original": data.QUIC.UserAgent}
+			}
+		}
+	}
+
 	// SSH client fingerprint (Hassh) when present
 	if data.SSHHassh != "" {
 		ecs["ssh"] = map[string]interface{}{
@@ -406,6 +456,79 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 	}
 
 	return l.writeJSON(ecs)
+}
+
+// dnsECS maps a decoded DNS message onto the ECS dns.* fields. EDNS has no
+// ECS field and goes under dns.edns.
+func dnsECS(d *dnsinfo.Info) map[string]interface{} {
+	out := map[string]interface{}{
+		"id":      strconv.Itoa(int(d.ID)), // ECS types dns.id as keyword
+		"op_code": d.OpCode,
+		"type":    "query",
+	}
+	if d.Response {
+		out["type"] = "answer"
+		out["response_code"] = d.RCode
+	}
+	if len(d.Flags) > 0 {
+		out["header_flags"] = d.Flags
+	}
+	if len(d.Questions) > 0 {
+		q := d.Questions[0]
+		out["question"] = map[string]interface{}{"name": q.Name, "type": q.Type, "class": q.Class}
+		if len(d.Questions) > 1 {
+			extra := make([]map[string]interface{}, 0, len(d.Questions)-1)
+			for _, q := range d.Questions[1:] {
+				extra = append(extra, map[string]interface{}{"name": q.Name, "type": q.Type, "class": q.Class})
+			}
+			out["questions_extra"] = extra
+		}
+	}
+	if d.Answers > 0 || d.Authority > 0 || d.Additional > 0 {
+		out["counts"] = map[string]interface{}{"answers": d.Answers, "authority": d.Authority, "additional": d.Additional}
+	}
+	if d.EDNS {
+		e := map[string]interface{}{"udp_size": d.EDNSUDPSize, "version": d.EDNSVersion, "do": d.EDNSDO}
+		if len(d.EDNSOptions) > 0 {
+			e["options"] = d.EDNSOptions
+		}
+		out["edns"] = e
+	}
+	return out
+}
+
+func quicECS(q *QUICData) map[string]interface{} {
+	out := map[string]interface{}{
+		"version":        q.Version,
+		"dcid":           q.DCID,
+		"decrypted":      q.Decrypted,
+		"hello_complete": q.HelloComplete,
+		"datagrams":      q.Datagrams,
+	}
+	if q.SCID != "" {
+		out["scid"] = q.SCID
+	}
+	if q.TokenLength > 0 {
+		out["token_length"] = q.TokenLength
+	}
+	if !q.HelloComplete && q.CryptoBytes > 0 {
+		out["crypto_bytes"] = q.CryptoBytes
+	}
+	if q.CloseReason != "" {
+		out["close_reason"] = q.CloseReason
+	}
+	if q.TransportParamsHash != "" || q.TransportParamsHex != "" {
+		tp := map[string]interface{}{}
+		if q.TransportParamsHash != "" {
+			tp["hash"] = q.TransportParamsHash
+			tp["string"] = q.TransportParamsStr
+		}
+		if q.TransportParamsHex != "" {
+			tp["hex"] = q.TransportParamsHex
+		}
+		out["client"] = map[string]interface{}{"transport_parameters": tp}
+	}
+	return out
 }
 
 func copyMap(m map[string]interface{}) map[string]interface{} {

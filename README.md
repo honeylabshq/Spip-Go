@@ -127,6 +127,34 @@ Hassh: [Salesforce HASSH](https://github.com/salesforce/hassh).
 Akin: [honeylabshq/akin](https://github.com/honeylabshq/akin).  
 TLS fingerprinting uses [github.com/psanford/tlsfingerprint](https://github.com/psanford/tlsfingerprint) (MIT).
 
+## UDP capture (DNS and QUIC)
+
+Off by default. With `udp_enabled = true` Spip also listens for UDP on the same port (or `udp_port`) and records every datagram it is handed. It never sends a reply. DNS, NTP, SNMP, memcached and SSDP are all amplification vectors, and a sensor that answers spoofed requests becomes a reflector aimed at whoever the spoofer chose.
+
+Each datagram is classified in this order:
+
+- QUIC. A client's Initial packets are decrypted with the public Initial keys (RFC 9001 section 5.2; versions 1, 2 and draft-29). CRYPTO frames are reassembled by offset, which handles Chromium's scrambled frame order and ClientHellos split across datagrams by post-quantum key shares. Retransmissions are folded in, so one connection attempt is one record. The ClientHello yields the same `tls.client.*` fields as TCP, with a JA4 that starts with `q`. `quic.client.transport_parameters.hash` fingerprints the QUIC implementation from its transport parameters. Values that change per connection are left out, including the GREASE version Chromium inserts at random. In testing it separated curl (ngtcp2), Chromium and quic-go while staying stable across connections from each. Unknown versions padded to 1200 bytes are recorded as version probes. An attempt whose ClientHello never completes is recorded after three seconds with the bytes that arrived.
+- DNS. Queries and unsolicited responses (backscatter from someone spoofing the sensor's address) are decoded into the ECS `dns.*` fields, with EDNS details under `dns.edns`. `event.summary` reads like `DNS query TXT/CH version.bind`.
+- Anything else is kept as raw UDP with its payload, as TCP probes are.
+
+Every UDP record carries `network.transport: udp` and a Community ID over protocol 17. UDP source addresses are not authenticated. A UDP record says what was sent, but not reliably who sent it, so it must not feed address reputation or blocklists the way TCP records do.
+
+### Host setup
+
+UDP needs a TPROXY rule, not the nat `REDIRECT` the TCP side uses. Under REDIRECT the kernel rewrites the destination before the socket sees it, and UDP has no `SO_ORIGINAL_DST`, so every event would carry Spip's own port. This was measured in a lab namespace: a datagram to port 53 arrived reporting port 7999. TPROXY delivers the datagram unchanged to Spip's transparent socket, which needs `CAP_NET_ADMIN` (Spip runs as root on the sensors).
+
+`scripts/udp-capture.sh` installs the rule. Run `print` first to see exactly what it will do:
+
+```bash
+PORT=8080 ./scripts/udp-capture.sh print
+PORT=8080 ./scripts/udp-capture.sh up      # idempotent
+./scripts/udp-capture.sh down
+```
+
+The script leaves alone everything the host needs. It skips loopback, so local resolvers such as systemd-resolved on 127.0.0.53 keep working. It skips replies to the host's own traffic (conntrack ESTABLISHED), broadcast and multicast, and every port with a non-loopback UDP listener at install time, such as WireGuard, Tailscale and DHCP. Pass `EXEMPT="..."` for more. It adds no fwmark or routing table, because the honeypot addresses are already local. The usual TPROXY recipe with a mark and a local routing table fails on hosts with `src_valid_mark=1`, which WireGuard tooling sets: reverse-path filtering then drops every packet as martian.
+
+Rate limiting is separate from TCP: `udp_rate_limit_per_second` (default 200) and `udp_rate_limit_burst` (default 2000). Drops, rate-limited datagrams and folded QUIC retransmissions are reported hourly and at shutdown.
+
 ## Loom (optional log shipping)
 
 Part of [log output](#log-output): when `[loom]` has `enabled = true`, the same ECS records are also batched and POSTed to your Loom ingest URL. Required when enabled: `url`, `sensor_id`, `token`. Optional: `batch_size` (default 50), `flush_interval` (e.g. `"10s"`), `insecure_skip_verify` (for self-signed Loom certs). The exporter runs asynchronously and does not block the capture loop; failed POSTs are logged to stderr and the batch is dropped (fail-open).
@@ -135,8 +163,9 @@ Part of [log output](#log-output): when `[loom]` has `enabled = true`, the same 
 ```
 .
 ├── cmd/                 # Main application entry point
-├── internal/            # Config, logging, network, TLS, fingerprinting, exporters (e.g. Loom)
-├── pkg/                 # Linux socket helpers (SO_ORIGINAL_DST via syscall)
+├── internal/            # Config, logging, network, TLS, fingerprinting, exporters (e.g. Loom),
+│                        # udp (capture), quic (Initial decryption), dnsinfo (DNS decoding)
+├── pkg/                 # Linux socket helpers (SO_ORIGINAL_DST, transparent UDP)
 ├── test/                # End-to-end test helpers
 └── scripts/             # Utility scripts (including `initial_setup.sh`)
 ```

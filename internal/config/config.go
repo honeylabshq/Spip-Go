@@ -46,8 +46,15 @@ type Config struct {
 	// populations, and they cost storage and bandwidth for records nobody
 	// wants. Accepts bare addresses ("192.0.2.10") and CIDR ("192.0.2.0/24"),
 	// IPv4 or IPv6.
-	IgnoreSources []string   `toml:"ignore_sources,omitempty"`
-	Loom          LoomConfig `toml:"loom,omitempty"`
+	IgnoreSources []string `toml:"ignore_sources,omitempty"`
+	// UDP capture. Off by default: it needs a TPROXY rule on the host (see
+	// scripts/udp-capture.sh), not the nat REDIRECT the TCP side uses, and it
+	// never answers anything. udp_port defaults to port.
+	UDPEnabled            bool       `toml:"udp_enabled,omitempty"`
+	UDPPort               uint16     `toml:"udp_port,omitempty"`
+	UDPRateLimitPerSecond int        `toml:"udp_rate_limit_per_second,omitempty"`
+	UDPRateLimitBurst     int        `toml:"udp_rate_limit_burst,omitempty"`
+	Loom                  LoomConfig `toml:"loom,omitempty"`
 
 	ignoreNets []netip.Prefix
 }
@@ -137,6 +144,14 @@ func (c *Config) ShouldCaptureClientHello() bool {
 		return true
 	}
 	return *c.CaptureClientHello
+}
+
+// UDPListenPort is the port the UDP listener binds.
+func (c *Config) UDPListenPort() uint16 {
+	if c.UDPPort != 0 {
+		return c.UDPPort
+	}
+	return c.Port
 }
 
 // IsTLSEnabled returns true if both certificate and key paths are configured

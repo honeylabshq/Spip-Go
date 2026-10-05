@@ -15,6 +15,8 @@ import (
 	"spip/internal/logging"
 	"spip/internal/network"
 	"spip/internal/tls"
+	"spip/internal/udp"
+	"spip/pkg/socket"
 )
 
 func main() {
@@ -115,6 +117,37 @@ func main() {
 
 	fmt.Fprintf(os.Stderr, "Listening on %s\n", addr)
 
+	// UDP capture, when enabled. Started after TCP so a UDP failure cannot
+	// take the TCP sensor down: it is logged and the sensor carries on.
+	var udpServer *udp.Server
+	var udpConn *net.UDPConn
+	if cfg.UDPEnabled {
+		udpAddr := fmt.Sprintf("%s:%d", cfg.IP, cfg.UDPListenPort())
+		res, err := socket.ListenUDP("udp", udpAddr)
+		if err != nil {
+			logger.Error("main", fmt.Sprintf("UDP capture disabled, listen failed: %v", err))
+		} else {
+			udpConn = res.Conn
+			if !res.Transparent {
+				logger.Warn("main", "UDP socket is not transparent (needs CAP_NET_ADMIN); TPROXY rules cannot deliver to it")
+			}
+			udpServer = udp.NewServer(logger, udp.Options{
+				Name:               cfg.Name,
+				CommunityIDSeed:    cfg.CommunityIDSeed,
+				IgnoreNets:         cfg.IgnoredNets(),
+				CaptureClientHello: cfg.ShouldCaptureClientHello(),
+				RatePerSecond:      float64(cfg.UDPRateLimitPerSecond),
+				Burst:              cfg.UDPRateLimitBurst,
+			})
+			go func() {
+				if err := udpServer.Serve(udpConn); err != nil {
+					logger.Error("main", fmt.Sprintf("UDP capture stopped: %v", err))
+				}
+			}()
+			fmt.Fprintf(os.Stderr, "UDP capture on %s (transparent=%v)\n", udpAddr, res.Transparent)
+		}
+	}
+
 	// Accept connections and handle graceful shutdown on signals
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -122,12 +155,15 @@ func main() {
 	// Periodically report what the drop list suppressed. Dropped traffic
 	// leaves no event behind, so without this a rule that stopped matching and
 	// a genuinely quiet network look the same in the data.
-	if len(cfg.IgnoredNets()) > 0 {
+	if len(cfg.IgnoredNets()) > 0 || udpServer != nil {
 		dropTicker := time.NewTicker(time.Hour)
 		defer dropTicker.Stop()
 		go func() {
 			for range dropTicker.C {
 				handler.ReportDrops()
+				if udpServer != nil {
+					udpServer.Report()
+				}
 			}
 		}()
 	}
@@ -166,6 +202,11 @@ func main() {
 	handler.ReportDrops()
 	fmt.Fprintln(os.Stderr, "Shutdown signal received, closing listener")
 	listener.Close()
+	if udpConn != nil {
+		udpConn.Close()
+		udpServer.Shutdown()
+		udpServer.Report()
+	}
 
 	if err := handler.Shutdown(15 * time.Second); err != nil {
 		fmt.Fprintf(os.Stderr, "Graceful shutdown completed with error: %v\n", err)
