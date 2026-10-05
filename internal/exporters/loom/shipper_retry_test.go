@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"spip/internal/config"
 )
@@ -94,5 +95,32 @@ func TestSend_DoesNotRetryOn401(t *testing.T) {
 	}
 	if len(*errs) == 0 {
 		t.Fatal("expected the drop to be reported, so the operator can see why nothing arrives")
+	}
+}
+
+func TestSend_RetriesOn429(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	s, errs := newTestShipper(t, srv.URL)
+	s.send([]map[string]interface{}{ev(1)}, 0)
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("expected a retry after 429, got %d attempts (%v)", got, *errs)
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	for in, want := range map[string]time.Duration{"": time.Second, "3": 3 * time.Second, "999": maxRetryAfter, "Wed, 21 Oct 2015 07:28:00 GMT": time.Second} {
+		if got := parseRetryAfter(in); got != want {
+			t.Errorf("parseRetryAfter(%q) = %v, want %v", in, got, want)
+		}
 	}
 }
