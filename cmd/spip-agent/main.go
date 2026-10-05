@@ -132,7 +132,7 @@ func main() {
 			// original destination then comes from conntrack.
 			ct, ctErr := conntrack.Open()
 			if ctErr != nil {
-				logger.Warn("main", fmt.Sprintf("conntrack unavailable, REDIRECT capture would lose destination ports: %v", ctErr))
+				logger.Info("main", fmt.Sprintf("conntrack lookups unavailable (only REDIRECT capture needs them): %v", ctErr))
 			} else {
 				defer ct.Close()
 			}

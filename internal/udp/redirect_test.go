@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"spip/internal/logging"
+	"spip/pkg/conntrack"
 	"spip/pkg/socket"
 )
 
@@ -50,7 +52,7 @@ func TestRedirectedLookupUsesTheReplyTuple(t *testing.T) {
 	ct := &fakeConntrack{answer: netip.MustParseAddrPort("192.0.2.1:53")}
 	s := NewServer(logging.NewLogger(&bytes.Buffer{}), Options{Conntrack: ct})
 	got := s.redirected(&net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 40000},
-		&socket.OriginalDst{IP: net.ParseIP("192.0.2.1"), Port: 8080})
+		&socket.OriginalDst{IP: net.ParseIP("192.0.2.1"), Port: 8080}, time.Now())
 	if got.Port != 53 || !got.IP.Equal(net.ParseIP("192.0.2.1")) {
 		t.Fatalf("got %v:%d", got.IP, got.Port)
 	}
@@ -67,7 +69,7 @@ func TestRedirectedLookupFailureKeepsTheListenerPort(t *testing.T) {
 	ct := &fakeConntrack{err: errors.New("no conntrack entry")}
 	s := NewServer(logging.NewLogger(&bytes.Buffer{}), Options{Conntrack: ct})
 	dst := &socket.OriginalDst{IP: net.ParseIP("192.0.2.1"), Port: 8080}
-	if got := s.redirected(&net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 1}, dst); got != dst {
+	if got := s.redirected(&net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 1}, dst, time.Now()); got != dst {
 		t.Fatalf("got %v", got)
 	}
 	if s.ctMissing.Load() != 1 {
@@ -117,5 +119,84 @@ func TestServeResolvesListenerAddressedDatagrams(t *testing.T) {
 	}
 	if port := get(rec, "destination.port"); port != float64(161) {
 		t.Fatalf("destination.port = %v, want 161", port)
+	}
+}
+
+func (f *fakeConntrack) calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.asked) / 2
+}
+
+func listenerAddressed(s *Server, n int) {
+	for i := 0; i < n; i++ {
+		s.HandleDatagram([]byte("probe"),
+			&net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 40000 + i},
+			&socket.OriginalDst{IP: net.ParseIP("192.0.2.1"), Port: 8080})
+	}
+}
+
+// The lookup costs a netlink round trip, so it must come after every check
+// that can drop a datagram: a flood is limited first and resolved second.
+func TestDroppedAndLimitedDatagramsNeverReachConntrack(t *testing.T) {
+	ct := &fakeConntrack{answer: netip.MustParseAddrPort("192.0.2.1:53")}
+	s := NewServer(logging.NewLogger(&bytes.Buffer{}), Options{
+		Conntrack:  ct,
+		IgnoreNets: []netip.Prefix{netip.MustParsePrefix("198.51.100.7/32")},
+	})
+	s.listenPort.Store(8080)
+	listenerAddressed(s, 5)
+	if ct.calls() != 0 {
+		t.Fatalf("ignored source caused %d lookups", ct.calls())
+	}
+
+	s = NewServer(logging.NewLogger(&bytes.Buffer{}), Options{
+		Conntrack: ct, RatePerSecond: 0.001, Burst: 2, SourceRate: 1000, SourceBurst: 1000,
+	})
+	s.listenPort.Store(8080)
+	listenerAddressed(s, 50)
+	if ct.calls() != 2 {
+		t.Fatalf("%d lookups for a burst of 2", ct.calls())
+	}
+}
+
+func TestDatagramsToOtherPortsAreNotLookedUp(t *testing.T) {
+	ct := &fakeConntrack{answer: netip.MustParseAddrPort("192.0.2.1:53")}
+	s := NewServer(logging.NewLogger(&bytes.Buffer{}), Options{Conntrack: ct})
+	s.listenPort.Store(8080)
+	s.HandleDatagram([]byte("probe"), &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 1},
+		&socket.OriginalDst{IP: net.ParseIP("192.0.2.1"), Port: 161})
+	if ct.calls() != 0 {
+		t.Fatal("TPROXY-delivered datagram was looked up")
+	}
+}
+
+func TestBreakerPausesLookupsAfterRepeatedFailures(t *testing.T) {
+	ct := &fakeConntrack{err: fmt.Errorf("netlink receive: %w", errors.New("resource temporarily unavailable"))}
+	s := NewServer(logging.NewLogger(&bytes.Buffer{}), Options{Conntrack: ct})
+	src := &net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 1}
+	dst := &socket.OriginalDst{IP: net.ParseIP("192.0.2.1"), Port: 8080}
+	t0 := time.Unix(1_800_000_000, 0)
+	for i := 0; i < 10; i++ {
+		s.redirected(src, dst, t0)
+	}
+	if ct.calls() != ctFailuresBeforePause || s.ctPaused.Load() != 10-ctFailuresBeforePause {
+		t.Fatalf("calls %d, paused %d", ct.calls(), s.ctPaused.Load())
+	}
+	s.redirected(src, dst, t0.Add(ctPause))
+	if ct.calls() != ctFailuresBeforePause+1 {
+		t.Fatal("lookups did not resume after the pause")
+	}
+}
+
+func TestMissingEntriesDoNotTripTheBreaker(t *testing.T) {
+	ct := &fakeConntrack{err: conntrack.ErrNotFound}
+	s := NewServer(logging.NewLogger(&bytes.Buffer{}), Options{Conntrack: ct})
+	for i := 0; i < 20; i++ {
+		s.redirected(&net.UDPAddr{IP: net.ParseIP("198.51.100.7"), Port: 1},
+			&socket.OriginalDst{IP: net.ParseIP("192.0.2.1"), Port: 8080}, time.Unix(1_800_000_000, 0))
+	}
+	if ct.calls() != 20 || s.ctPaused.Load() != 0 {
+		t.Fatalf("calls %d, paused %d", ct.calls(), s.ctPaused.Load())
 	}
 }

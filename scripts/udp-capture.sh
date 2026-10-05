@@ -10,10 +10,17 @@
 #
 #   tproxy    mangle-table TPROXY. The datagram reaches spip's transparent
 #             socket untouched and the socket reads the real destination.
-#   redirect  nat-table REDIRECT, for hosts whose kernel has no TPROXY target
-#             (container platforms that do not expose the module). The kernel
-#             rewrites the destination to spip, and spip reads the original
-#             one back from conntrack over netlink.
+#   redirect  nat-table REDIRECT. The kernel rewrites the destination to
+#             spip, and spip reads the original one back from conntrack over
+#             netlink.
+#
+# auto uses redirect inside an OpenVZ/Virtuozzo container and on kernels that
+# refuse a TPROXY rule, and tproxy otherwise. Accepting the rule is not proof
+# that TPROXY delivers: an OpenVZ container accepts it (the host loads the
+# module on first use) and then never delivers a packet through its venet
+# interface. That was measured, which is why the container check comes first.
+# Elsewhere, check the first datagrams after "up" and pin MODE=redirect if
+# TPROXY matches packets that never reach spip.
 #
 # The nat REDIRECT the TCP side uses would also lose the port for UDP on its
 # own, because UDP has no SO_ORIGINAL_DST; the conntrack lookup is what makes
@@ -76,10 +83,21 @@ has_tproxy() {
 	return $ok
 }
 
+# An OpenVZ/Virtuozzo container has /proc/vz but not the host-only /proc/bc.
+openvz() { [ -d /proc/vz ] && [ ! -d /proc/bc ]; }
+
 mode() {
 	case "$MODE" in
 	tproxy | redirect) echo "$MODE" ;;
-	auto) if has_tproxy; then echo tproxy; else echo redirect; fi ;;
+	auto)
+		if openvz; then
+			echo redirect
+		elif has_tproxy; then
+			echo tproxy
+		else
+			echo redirect
+		fi
+		;;
 	*)
 		echo "MODE must be auto, tproxy or redirect" >&2
 		exit 2

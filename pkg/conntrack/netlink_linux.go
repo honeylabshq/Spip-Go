@@ -32,7 +32,9 @@ func Open() (*Client, error) {
 		syscall.Close(fd)
 		return nil, fmt.Errorf("netlink bind: %w", err)
 	}
-	tv := syscall.NsecToTimeval((250 * time.Millisecond).Nanoseconds())
+	// The kernel answers from memory in microseconds; a slow reply means
+	// something is wrong, and the caller backs off.
+	tv := syscall.NsecToTimeval((100 * time.Millisecond).Nanoseconds())
 	if err := syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv); err != nil {
 		syscall.Close(fd)
 		return nil, fmt.Errorf("netlink timeout: %w", err)
