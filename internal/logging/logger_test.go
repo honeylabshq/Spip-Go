@@ -467,8 +467,8 @@ func TestLogConnection_BehavioralAndJA3(t *testing.T) {
 //
 // The split used to be strings.LastIndex(host, ":"), which is correct for
 // "example.com:80" and wrong for every bracket-less IPv6 literal: it cut at the
-// final colon of the address itself, so "2a0f:85c1:b73:383::a" was recorded as
-// "2a0f:85c1:b73:383:". That silently corrupted url.domain, and downstream the
+// final colon of the address itself, so "2001:db8:0:1::a" was recorded as
+// "2001:db8:0:1:". That silently corrupted url.domain, and downstream the
 // truncated form no longer matched the sensor-address redaction applied to the
 // public dataset, so a partial sensor address reached a published column.
 //
@@ -485,9 +485,9 @@ func TestLogConnection_HostHeaderIPv6(t *testing.T) {
 		{"name and port", "example.com:8080", "example.com", 8080},
 		{"ipv4", "1.2.3.4", "1.2.3.4", 0},
 		{"ipv4 and port", "1.2.3.4:80", "1.2.3.4", 80},
-		{"bare ipv6", "2a0f:85c1:b73:383::a", "2a0f:85c1:b73:383::a", 0},
-		{"bracketed ipv6", "[2a0f:85c1:b73:383::a]", "2a0f:85c1:b73:383::a", 0},
-		{"bracketed ipv6 and port", "[2a0f:85c1:b73:383::a]:8080", "2a0f:85c1:b73:383::a", 8080},
+		{"bare ipv6", "2001:db8:0:1::a", "2001:db8:0:1::a", 0},
+		{"bracketed ipv6", "[2001:db8:0:1::a]", "2001:db8:0:1::a", 0},
+		{"bracketed ipv6 and port", "[2001:db8:0:1::a]:8080", "2001:db8:0:1::a", 8080},
 		{"loopback ipv6", "::1", "::1", 0},
 	}
 

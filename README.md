@@ -153,7 +153,7 @@ PORT=8080 ./scripts/udp-capture.sh up      # idempotent
 
 The script leaves alone everything the host needs. It skips loopback, so local resolvers such as systemd-resolved on 127.0.0.53 keep working. It skips replies to the host's own traffic (conntrack ESTABLISHED), broadcast and multicast, and every port with a non-loopback UDP listener at install time, such as WireGuard, Tailscale and DHCP. Pass `EXEMPT="..."` for more. It adds no fwmark or routing table, because the honeypot addresses are already local. The usual TPROXY recipe with a mark and a local routing table fails on hosts with `src_valid_mark=1`, which WireGuard tooling sets: reverse-path filtering then drops every packet as martian.
 
-Rate limiting is separate from TCP: `udp_rate_limit_per_second` (default 200) and `udp_rate_limit_burst` (default 2000). Drops, rate-limited datagrams and folded QUIC retransmissions are reported hourly and at shutdown.
+Every input is treated as hostile. A global limit (`udp_rate_limit_per_second`, default 50, `udp_rate_limit_burst`, default 500) sits behind a per-source limit (`udp_source_rate_limit_per_second`, default 5, `udp_source_rate_limit_burst`, default 20) keyed by IPv4 address or IPv6 /64, so one sender cannot spend the whole budget. At most 2 KB of each datagram is stored, while `source.bytes` keeps its real size. Pending QUIC attempts are capped at 1024 of 8 KB each. Attacker-supplied text (DNS names, ALPN values, close reasons) is escaped to printable ASCII. Drops, limits, kernel receive-buffer overflows (`SO_RXQ_OVFL`) and folded QUIC retransmissions are reported hourly and at shutdown.
 
 ## Loom (optional log shipping)
 

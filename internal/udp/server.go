@@ -1,16 +1,6 @@
-// Package udp captures UDP traffic delivered to the sensor and records it
-// without ever replying.
-//
-// Replying is the one thing a UDP honeypot must not do by default: every
-// protocol worth emulating on UDP (DNS, NTP, SNMP, memcached, SSDP) is also an
-// amplification vector, and a sensor that answers spoofed requests becomes a
-// reflector aimed at whoever the spoofer chose. Capture-only still yields the
-// valuable part. A DNS query names what the scanner wanted; a QUIC client's
-// first flight contains its entire TLS ClientHello.
-//
-// UDP source addresses are not authenticated. Records from this package
-// describe what was sent, not reliably who sent it, and consumers that build
-// address reputation or blocklists must not treat them like TCP records.
+// Package udp records UDP traffic delivered to the sensor and never replies:
+// answering spoofed UDP turns a sensor into a reflector. Source addresses are
+// not authenticated, so records describe what was sent, not reliably who sent it.
 package udp
 
 import (
@@ -19,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -35,11 +26,21 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// MaxDatagram is the largest datagram read. Anything longer is truncated by
-// the kernel and recorded as what arrived.
-const MaxDatagram = 65535
+const (
+	MaxDatagram      = 65535
+	MaxStoredPayload = 2048
+	minQUICDatagram  = 1200 // RFC 9000 section 14.1
 
-// Options configures a Server.
+	defaultRate          = 50
+	defaultBurst         = 500
+	defaultSourceRate    = 5
+	defaultSourceBurst   = 20
+	maxTrackedSources    = 16384
+	sweepInterval        = 500 * time.Millisecond
+	controlMessageBuffer = 512
+)
+
+// Options configures a Server. Zero values select the defaults.
 type Options struct {
 	Name               string
 	CommunityIDSeed    uint16
@@ -47,6 +48,8 @@ type Options struct {
 	CaptureClientHello bool
 	RatePerSecond      float64
 	Burst              int
+	SourceRate         float64
+	SourceBurst        int
 }
 
 // Server reads datagrams from one socket and logs them.
@@ -54,21 +57,24 @@ type Server struct {
 	opt     Options
 	logger  logging.Logger
 	limiter *rate.Limiter
+	sources *sourceLimiter
 	asm     *quic.Assembler
 	now     func() time.Time
 
-	dropped     atomic.Uint64
-	droppedByIP sync.Map // string -> *atomic.Uint64
-	limited     atomic.Uint64
-	// NoOrigDst counts datagrams that arrived without a TPROXY original
-	// destination and were attributed to the listener's own port.
-	noOrigDst atomic.Uint64
+	dropped      atomic.Uint64
+	droppedByIP  sync.Map // string -> *atomic.Uint64
+	limited      atomic.Uint64
+	sourceLimit  atomic.Uint64
+	noOrigDst    atomic.Uint64
+	kernelDrops  atomic.Uint32
+	panics       atomic.Uint64
+	lastPanicLog atomic.Int64
 
-	stop chan struct{}
-	wg   sync.WaitGroup
+	stop     chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 }
 
-// meta is the per-attempt context carried through QUIC reassembly.
 type meta struct {
 	src *net.UDPAddr
 	dst *socket.OriginalDst
@@ -76,31 +82,36 @@ type meta struct {
 
 func NewServer(logger logging.Logger, opt Options) *Server {
 	if opt.RatePerSecond <= 0 {
-		opt.RatePerSecond = 200
+		opt.RatePerSecond = defaultRate
 	}
 	if opt.Burst <= 0 {
-		opt.Burst = 2000
+		opt.Burst = defaultBurst
+	}
+	if opt.SourceRate <= 0 {
+		opt.SourceRate = defaultSourceRate
+	}
+	if opt.SourceBurst <= 0 {
+		opt.SourceBurst = defaultSourceBurst
 	}
 	return &Server{
 		opt:     opt,
 		logger:  logger,
 		limiter: rate.NewLimiter(rate.Limit(opt.RatePerSecond), opt.Burst),
+		sources: newSourceLimiter(opt.SourceRate, opt.SourceBurst, maxTrackedSources),
 		asm:     quic.NewAssembler(),
 		now:     time.Now,
 		stop:    make(chan struct{}),
 	}
 }
 
-// Serve reads from conn until it is closed. It also runs the timer that
-// records QUIC attempts whose ClientHello never completed.
+// Serve reads from conn until it is closed.
 func (s *Server) Serve(conn *net.UDPConn) error {
 	s.wg.Add(1)
 	go s.sweep()
-	defer s.wg.Done()
 
 	local, _ := conn.LocalAddr().(*net.UDPAddr)
 	buf := make([]byte, MaxDatagram)
-	oob := make([]byte, 512)
+	oob := make([]byte, controlMessageBuffer)
 	for {
 		n, oobn, _, src, err := conn.ReadMsgUDP(buf, oob)
 		if err != nil {
@@ -116,10 +127,12 @@ func (s *Server) Serve(conn *net.UDPConn) error {
 		if n == 0 || src == nil {
 			continue
 		}
-		dst, err := socket.OrigDstFromOOB(oob[:oobn])
+		ctl, err := socket.ParseControl(oob[:oobn])
+		if ctl.HasDrops {
+			s.kernelDrops.Store(ctl.Drops)
+		}
+		dst := ctl.OrigDst
 		if err != nil {
-			// Delivered to the listen port itself rather than by a TPROXY
-			// rule. Record it against that port so the event is not lost.
 			s.noOrigDst.Add(1)
 			dst = &socket.OriginalDst{IP: net.IPv4zero, Port: 0}
 			if local != nil {
@@ -130,13 +143,9 @@ func (s *Server) Serve(conn *net.UDPConn) error {
 	}
 }
 
-// Shutdown stops the sweeper and records any QUIC attempts still waiting.
+// Shutdown stops the sweeper and records QUIC attempts still pending.
 func (s *Server) Shutdown() {
-	select {
-	case <-s.stop:
-	default:
-		close(s.stop)
-	}
+	s.stopOnce.Do(func() { close(s.stop) })
 	s.wg.Wait()
 	for _, at := range s.asm.Flush() {
 		s.logAttempt(at)
@@ -145,7 +154,7 @@ func (s *Server) Shutdown() {
 
 func (s *Server) sweep() {
 	defer s.wg.Done()
-	t := time.NewTicker(500 * time.Millisecond)
+	t := time.NewTicker(sweepInterval)
 	defer t.Stop()
 	for {
 		select {
@@ -159,102 +168,114 @@ func (s *Server) sweep() {
 	}
 }
 
-// HandleDatagram classifies and records one datagram. Exported for tests.
+// HandleDatagram classifies and records one datagram.
 func (s *Server) HandleDatagram(payload []byte, src *net.UDPAddr, dst *socket.OriginalDst) {
 	if src == nil || dst == nil || len(payload) == 0 {
 		return
 	}
-	if s.shouldIgnore(src.IP) {
-		s.countDrop(src.IP.String())
+	defer s.recoverDatagram()
+
+	addr, ok := netip.AddrFromSlice(src.IP)
+	if !ok {
 		return
 	}
-	if !s.limiter.Allow() {
-		s.limited.Add(1)
+	if s.shouldIgnore(addr) {
+		s.countDrop(addr.Unmap().String())
 		return
 	}
 	now := s.now()
+	if !s.sources.allow(addr, now) {
+		s.sourceLimit.Add(1)
+		return
+	}
+	if !s.limiter.AllowN(now, 1) {
+		s.limited.Add(1)
+		return
+	}
 
 	if s.handleQUIC(payload, src, dst, now) {
 		return
 	}
+	rec := s.base(payload, src, dst, now)
 	if info, err := dnsinfo.Parse(payload); err == nil {
-		rec := s.base(payload, src, dst, now)
 		rec.NetworkProtocol = "dns"
 		rec.DNS = info
 		rec.Payload = info.Summary()
-		s.write(rec)
-		return
+	} else {
+		rec.Payload = string(payload[:min(len(payload), MaxStoredPayload)])
 	}
-	rec := s.base(payload, src, dst, now)
-	rec.Payload = string(payload)
 	s.write(rec)
 }
 
-// handleQUIC returns true when the datagram was QUIC and has been dealt with.
+func (s *Server) recoverDatagram() {
+	r := recover()
+	if r == nil {
+		return
+	}
+	s.panics.Add(1)
+	now := time.Now().Unix()
+	if last := s.lastPanicLog.Load(); now-last >= 60 && s.lastPanicLog.CompareAndSwap(last, now) {
+		s.logger.Error("udp", fmt.Sprintf("datagram handler recovered from panic: %v\n%s", r, debug.Stack()))
+	}
+}
+
+// handleQUIC returns true when the datagram was QUIC and has been handled.
 func (s *Server) handleQUIC(payload []byte, src *net.UDPAddr, dst *socket.OriginalDst, now time.Time) bool {
 	pkts, err := quic.ParseDatagram(payload)
-	if errors.Is(err, quic.ErrNotQUIC) || len(pkts) == 0 {
+	if len(pkts) == 0 {
 		return false
 	}
 	first := pkts[0]
 
-	// A version this sensor has no keys for: a version-negotiation probe, a
-	// future version, or binary noise whose first byte has the high bit set.
-	// Only call it QUIC when it has the shape a client's first datagram must
-	// have (RFC 9000 14.1: padded to 1200 bytes; fixed bit set; connection IDs
-	// within the v1 limit).
-	if first.Frames == nil && !isKnown(first.Version) {
-		if len(payload) < 1200 || payload[0]&0x40 == 0 || len(first.DCID) > 20 || len(first.SCID) > 20 || first.Version == 0 {
+	if !quic.Known(first.Version) {
+		// Unknown versions count as QUIC only with the shape a client's first
+		// datagram must have; anything else is left to the other classifiers.
+		if len(payload) < minQUICDatagram || payload[0]&0x40 == 0 || first.Version == 0 ||
+			len(first.DCID) > 20 || len(first.SCID) > 20 {
 			return false
 		}
-		rec := s.base(payload, src, dst, now)
-		rec.NetworkProtocol = "quic"
-		rec.QUIC = &logging.QUICData{
-			Version: quic.VersionName(first.Version), DCID: hex.EncodeToString(first.DCID),
-			SCID: hex.EncodeToString(first.SCID), Datagrams: 1,
-		}
-		rec.Payload = fmt.Sprintf("QUIC version %s probe", quic.VersionName(first.Version))
-		s.write(rec)
+		s.writeQUICHeader(payload, src, dst, now, first, "probe")
 		return true
 	}
 
 	key := src.String() + "|" + hex.EncodeToString(first.DCID)
-	added := false
+	decrypted := false
 	for i, p := range pkts {
 		if p.Frames == nil {
-			continue // 0-RTT or Handshake coalesced behind the Initial
+			continue
 		}
-		added = true
+		decrypted = true
 		if at := s.asm.Add(key, now, p, payload, &meta{src: src, dst: dst}, i == 0); at != nil {
 			s.logAttempt(at)
 		}
 	}
-	if added {
-		return true
+	if !decrypted {
+		reason := "undecrypted packet"
+		if err != nil {
+			reason = "Initial did not decrypt"
+		}
+		s.writeQUICHeader(payload, src, dst, now, first, reason)
 	}
-	// Known version but nothing decrypted: a 0-RTT or Handshake packet on its
-	// own, or an Initial that failed authentication. Keep it as QUIC so it is
-	// not mistaken for DNS or raw noise, marked as not decrypted.
-	rec := s.base(payload, src, dst, now)
-	rec.NetworkProtocol = "quic"
-	rec.QUIC = &logging.QUICData{
-		Version: quic.VersionName(first.Version), DCID: hex.EncodeToString(first.DCID),
-		SCID: hex.EncodeToString(first.SCID), Datagrams: 1,
-	}
-	reason := "undecrypted packet"
-	if err != nil {
-		reason = "Initial did not decrypt"
-	}
-	rec.Payload = fmt.Sprintf("QUIC v%s %s", quic.VersionName(first.Version), reason)
-	s.write(rec)
 	return true
 }
 
-func isKnown(v uint32) bool {
-	return v == quic.Version1 || v == quic.Version2 || v == quic.VersionDraft29
+func (s *Server) writeQUICHeader(payload []byte, src *net.UDPAddr, dst *socket.OriginalDst, now time.Time, p *quic.Packet, what string) {
+	rec := s.base(payload, src, dst, now)
+	rec.NetworkProtocol = "quic"
+	rec.QUIC = &logging.QUICData{
+		Version:   quic.VersionName(p.Version),
+		DCID:      hex.EncodeToString(p.DCID),
+		SCID:      hex.EncodeToString(p.SCID),
+		Datagrams: 1,
+	}
+	if what == "probe" {
+		rec.Payload = "QUIC version " + rec.QUIC.Version + " probe"
+	} else {
+		rec.Payload = "QUIC v" + rec.QUIC.Version + " " + what
+	}
+	s.write(rec)
 }
 
-// logAttempt writes one record for a QUIC connection attempt, complete or not.
 func (s *Server) logAttempt(at *quic.Attempt) {
 	m, ok := at.Meta.(*meta)
 	if !ok || m == nil {
@@ -276,43 +297,41 @@ func (s *Server) logAttempt(at *quic.Attempt) {
 	}
 	rec.QUIC = q
 	summary := []string{"QUIC v" + q.Version, "Initial"}
-	if at.Complete {
-		if h, err := quic.ParseHello(at.Hello); err == nil {
-			rec.IsTLS = true
-			rec.TLSJA4 = h.JA4
-			rec.TLSJA3 = h.JA3
-			rec.TLSServerName = h.ServerName
-			rec.TLSSupportedProtocols = h.ALPN
-			if s.opt.CaptureClientHello {
-				rec.TLSClientHelloHex = hex.EncodeToString(h.HelloRecord)
-			}
-			q.TransportParamsHash = h.TransportParamsHash
-			q.TransportParamsStr = h.TransportParamsStr
-			q.TransportParamsHex = h.TransportParamsHex
-			q.UserAgent = h.UserAgent
-			if h.ServerName != "" {
-				summary = append(summary, "sni="+h.ServerName)
-			}
-			if len(h.ALPN) > 0 {
-				summary = append(summary, "alpn="+strings.Join(h.ALPN, ","))
-			}
-		} else {
-			summary = append(summary, "(ClientHello did not parse)")
-		}
-	} else {
+	switch h, err := quic.ParseHello(at.Hello); {
+	case !at.Complete:
 		summary = append(summary, fmt.Sprintf("(ClientHello incomplete, %d bytes)", at.CryptoBytes))
+	case err != nil:
+		summary = append(summary, "(ClientHello did not parse)")
+	default:
+		rec.IsTLS = true
+		rec.TLSJA4 = h.JA4
+		rec.TLSJA3 = h.JA3
+		rec.TLSServerName = h.ServerName
+		rec.TLSSupportedProtocols = h.ALPN
+		if s.opt.CaptureClientHello {
+			rec.TLSClientHelloHex = hex.EncodeToString(h.HelloRecord)
+		}
+		q.TransportParamsHash = h.TransportParamsHash
+		q.TransportParamsStr = h.TransportParamsStr
+		q.TransportParamsHex = h.TransportParamsHex
+		q.UserAgent = h.UserAgent
+		if h.ServerName != "" {
+			summary = append(summary, "sni="+h.ServerName)
+		}
+		if len(h.ALPN) > 0 {
+			summary = append(summary, "alpn="+strings.Join(h.ALPN, ","))
+		}
 	}
 	rec.Payload = strings.Join(summary, " ")
 	s.write(rec)
 }
 
 func (s *Server) base(payload []byte, src *net.UDPAddr, dst *socket.OriginalDst, ts time.Time) *logging.ConnectionData {
-	srcIP := src.IP.String()
-	dstIP := dst.IP.String()
+	srcIP, dstIP := src.IP.String(), dst.IP.String()
 	return &logging.ConnectionData{
 		Name:            s.opt.Name,
 		Timestamp:       ts.Unix(),
-		PayloadHex:      hex.EncodeToString(payload),
+		PayloadHex:      hex.EncodeToString(payload[:min(len(payload), MaxStoredPayload)]),
 		SourceIP:        srcIP,
 		SourcePort:      uint16(src.Port),
 		DestinationIP:   dstIP,
@@ -331,14 +350,7 @@ func (s *Server) write(rec *logging.ConnectionData) {
 	}
 }
 
-func (s *Server) shouldIgnore(ip net.IP) bool {
-	if len(s.opt.IgnoreNets) == 0 {
-		return false
-	}
-	addr, ok := netip.AddrFromSlice(ip)
-	if !ok {
-		return false
-	}
+func (s *Server) shouldIgnore(addr netip.Addr) bool {
 	addr = addr.Unmap()
 	for _, n := range s.opt.IgnoreNets {
 		if n.Contains(addr) {
@@ -357,13 +369,16 @@ func (s *Server) countDrop(ip string) {
 	c.(*atomic.Uint64).Add(1)
 }
 
-// Report logs what was suppressed since start: dropped sources, rate-limited
-// datagrams, QUIC attempts refused for memory, retransmissions folded into
-// earlier records, and datagrams that bypassed TPROXY.
+// Report logs what was suppressed since start.
 func (s *Server) Report() {
-	parts := []string{}
+	var parts []string
+	add := func(n uint64, label string) {
+		if n > 0 {
+			parts = append(parts, fmt.Sprintf("%s %d", label, n))
+		}
+	}
 	if n := s.dropped.Load(); n > 0 {
-		per := []string{}
+		var per []string
 		s.droppedByIP.Range(func(k, v any) bool {
 			per = append(per, fmt.Sprintf("%s=%d", k, v.(*atomic.Uint64).Load()))
 			return true
@@ -371,21 +386,15 @@ func (s *Server) Report() {
 		sort.Strings(per)
 		parts = append(parts, fmt.Sprintf("ignore_sources dropped %d (%s)", n, strings.Join(per, " ")))
 	}
-	if n := s.limited.Load(); n > 0 {
-		parts = append(parts, fmt.Sprintf("rate limited %d", n))
+	overflow, retransmits := s.asm.Stats()
+	add(s.limited.Load(), "rate limited")
+	add(s.sourceLimit.Load(), "per-source limited")
+	add(uint64(s.kernelDrops.Load()), "kernel receive drops")
+	add(overflow, "quic attempts refused at capacity")
+	add(retransmits, "quic retransmits folded")
+	add(s.noOrigDst.Load(), "datagrams without TPROXY destination")
+	add(s.panics.Load(), "handler panics recovered")
+	if len(parts) > 0 {
+		s.logger.Info("udp", "since start: "+strings.Join(parts, "; "))
 	}
-	overflow, retrans := s.asm.Stats()
-	if n := overflow; n > 0 {
-		parts = append(parts, fmt.Sprintf("quic attempts refused at capacity %d", n))
-	}
-	if n := retrans; n > 0 {
-		parts = append(parts, fmt.Sprintf("quic retransmits folded %d", n))
-	}
-	if n := s.noOrigDst.Load(); n > 0 {
-		parts = append(parts, fmt.Sprintf("datagrams without TPROXY original destination %d", n))
-	}
-	if len(parts) == 0 {
-		return
-	}
-	s.logger.Info("udp", "since start: "+strings.Join(parts, "; "))
 }

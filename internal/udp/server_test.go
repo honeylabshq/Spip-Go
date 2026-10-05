@@ -217,12 +217,55 @@ func TestIgnoredSourceLeavesNoRecord(t *testing.T) {
 	}
 }
 
-func TestRateLimit(t *testing.T) {
-	r := newRig(t, Options{RatePerSecond: 1, Burst: 3})
+func TestGlobalRateLimit(t *testing.T) {
+	r := newRig(t, Options{RatePerSecond: 1, Burst: 3, SourceRate: 100, SourceBurst: 100})
 	for i := 0; i < 10; i++ {
 		r.send(dnsQuery(t), 40000+i, 53)
 	}
 	if n := len(r.records()); n != 3 || r.s.limited.Load() != 7 {
 		t.Fatalf("records %d limited %d", n, r.s.limited.Load())
+	}
+}
+
+// One source cannot spend the whole budget; others still get through.
+func TestPerSourceRateLimit(t *testing.T) {
+	r := newRig(t, Options{SourceRate: 1, SourceBurst: 2})
+	for i := 0; i < 10; i++ {
+		r.send(dnsQuery(t), 40000+i, 53)
+	}
+	r.s.HandleDatagram(dnsQuery(t), &net.UDPAddr{IP: net.ParseIP("203.0.113.9"), Port: 1}, &socket.OriginalDst{IP: net.IPv4(192, 0, 2, 1), Port: 53})
+	if n := len(r.records()); n != 3 || r.s.sourceLimit.Load() != 8 {
+		t.Fatalf("records %d source-limited %d", n, r.s.sourceLimit.Load())
+	}
+}
+
+func TestSourceLimiterBounded(t *testing.T) {
+	l := newSourceLimiter(1, 1, 4)
+	now := time.Unix(0, 0)
+	for i := 0; i < 4; i++ {
+		if !l.allow(netip.AddrFrom4([4]byte{10, 0, 0, byte(i)}), now) {
+			t.Fatal("refused under capacity")
+		}
+	}
+	if l.allow(netip.MustParseAddr("10.0.0.99"), now) {
+		t.Fatal("admitted a new source with the table full and nothing idle")
+	}
+	if !l.allow(netip.MustParseAddr("10.0.0.99"), now.Add(2*time.Minute)) {
+		t.Fatal("idle entries were not evicted")
+	}
+	if sourceKey(netip.MustParseAddr("2001:db8::1")) != sourceKey(netip.MustParseAddr("2001:db8::ffff")) {
+		t.Fatal("IPv6 sources in one /64 must share a bucket")
+	}
+}
+
+func TestStoredPayloadIsCapped(t *testing.T) {
+	r := newRig(t, Options{})
+	r.send(make([]byte, 9000), 40000, 9999)
+	m := r.records()[0]
+	if h, _ := get(m, "event.original_payload_hex").(string); len(h) != 2*MaxStoredPayload {
+		t.Errorf("stored %d hex chars", len(h))
+	}
+	if get(m, "source.bytes") != float64(9000) {
+		t.Errorf("source.bytes %v, want the full datagram size", get(m, "source.bytes"))
 	}
 }
