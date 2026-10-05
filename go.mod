@@ -10,3 +10,5 @@ require (
 )
 
 require github.com/honeylabshq/akin v0.3.0
+
+require golang.org/x/net v0.50.0
