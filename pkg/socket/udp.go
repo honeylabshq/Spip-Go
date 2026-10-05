@@ -12,64 +12,60 @@ import (
 	"unsafe"
 )
 
-// UDP capture relies on TPROXY, not on the nat REDIRECT the TCP side uses.
-//
-// With REDIRECT the kernel rewrites the destination before the socket sees the
-// datagram, and UDP has no SO_ORIGINAL_DST. IP_RECVORIGDSTADDR then reports the
-// rewritten address: measured on 2026-10-05, a datagram sent to port 53 under
-// "REDIRECT --to-ports 7999" arrives with an original destination of :7999, so
-// every UDP event would carry the sensor's own listen port. TPROXY delivers the
-// datagram unmodified to a socket that has IP_TRANSPARENT set, and the control
-// message then carries the port the sender chose.
+// UDP capture uses TPROXY. Under the nat REDIRECT the TCP side uses, the
+// kernel rewrites the destination before the socket sees it and UDP has no
+// SO_ORIGINAL_DST, so IP_RECVORIGDSTADDR would report the listener's own port.
 const (
 	ipTransparent     = 19 // IP_TRANSPARENT
-	ipRecvOrigDstAddr = 20 // IP_RECVORIGDSTADDR, cmsg type IP_ORIGDSTADDR
+	ipRecvOrigDstAddr = 20 // IP_RECVORIGDSTADDR
+	ipv6RecvOrigDst   = 74 // IPV6_RECVORIGDSTADDR
 	ipv6Transparent   = 75 // IPV6_TRANSPARENT
-	ipv6RecvOrigDst   = 74 // IPV6_RECVORIGDSTADDR, cmsg type IPV6_ORIGDSTADDR
+	soRxqOvfl         = 40 // SO_RXQ_OVFL
+
+	udpReceiveBuffer = 4 << 20
 )
 
-// ErrNoOrigDst means the datagram carried no original-destination control
-// message, which is what happens when no TPROXY rule delivered it (for example
-// a datagram sent straight to the listen port).
+// ErrNoOrigDst means the datagram was not delivered by a TPROXY rule.
 var ErrNoOrigDst = errors.New("no original destination control message")
 
-// UDPListenResult reports what ListenUDP managed to enable. Transparent is false
-// when IP_TRANSPARENT was refused (no CAP_NET_ADMIN): the listener still works
-// for datagrams addressed to its own port, but TPROXY cannot deliver to it.
-type UDPListenResult struct {
-	Conn        *net.UDPConn
+// UDPListener is a UDP socket prepared for TPROXY capture.
+type UDPListener struct {
+	Conn *net.UDPConn
+	// Transparent is false when IP_TRANSPARENT was refused (no CAP_NET_ADMIN);
+	// TPROXY rules cannot deliver to such a socket.
 	Transparent bool
 }
 
-// ListenUDP opens a UDP listener that asks the kernel for the original
-// destination of every datagram, and tries to make it transparent so TPROXY
-// rules can hand it traffic for any port. network is "udp", "udp4" or "udp6".
-func ListenUDP(network, addr string) (*UDPListenResult, error) {
-	res := &UDPListenResult{}
+// ListenUDP opens a UDP listener that reports each datagram's original
+// destination and kernel drop count. network is "udp", "udp4" or "udp6".
+func ListenUDP(network, addr string) (*UDPListener, error) {
+	l := &UDPListener{}
 	lc := net.ListenConfig{
 		Control: func(netw, _ string, c syscall.RawConn) error {
 			var setErr error
 			err := c.Control(func(fd uintptr) {
+				s := int(fd)
 				v6 := netw == "udp6"
-				// Transparent is best effort; the result says whether it held.
 				if v6 {
-					res.Transparent = syscall.SetsockoptInt(int(fd), syscall.SOL_IPV6, ipv6Transparent, 1) == nil
+					l.Transparent = syscall.SetsockoptInt(s, syscall.SOL_IPV6, ipv6Transparent, 1) == nil
 				} else {
-					res.Transparent = syscall.SetsockoptInt(int(fd), syscall.SOL_IP, ipTransparent, 1) == nil
-					// A dual-stack udp socket also receives v4-mapped traffic,
-					// so ask for both families where the kernel allows it.
-					if netw == "udp" {
-						_ = syscall.SetsockoptInt(int(fd), syscall.SOL_IPV6, ipv6Transparent, 1)
-					}
+					l.Transparent = syscall.SetsockoptInt(s, syscall.SOL_IP, ipTransparent, 1) == nil
 				}
-				if err := syscall.SetsockoptInt(int(fd), syscall.SOL_IP, ipRecvOrigDstAddr, 1); err != nil && !v6 {
-					setErr = fmt.Errorf("setsockopt IP_RECVORIGDSTADDR: %w", err)
+				// A dual-stack socket also receives IPv4, which reports its
+				// destination through the IPv4 option.
+				v4err := syscall.SetsockoptInt(s, syscall.SOL_IP, ipRecvOrigDstAddr, 1)
+				if !v6 && v4err != nil {
+					setErr = fmt.Errorf("setsockopt IP_RECVORIGDSTADDR: %w", v4err)
+					return
 				}
-				if v6 || netw == "udp" {
-					if err := syscall.SetsockoptInt(int(fd), syscall.SOL_IPV6, ipv6RecvOrigDst, 1); err != nil && v6 {
+				if v6 {
+					if err := syscall.SetsockoptInt(s, syscall.SOL_IPV6, ipv6RecvOrigDst, 1); err != nil {
 						setErr = fmt.Errorf("setsockopt IPV6_RECVORIGDSTADDR: %w", err)
+						return
 					}
 				}
+				_ = syscall.SetsockoptInt(s, syscall.SOL_SOCKET, soRxqOvfl, 1)
+				_ = syscall.SetsockoptInt(s, syscall.SOL_SOCKET, syscall.SO_RCVBUF, udpReceiveBuffer)
 			})
 			if err != nil {
 				return err
@@ -86,41 +82,53 @@ func ListenUDP(network, addr string) (*UDPListenResult, error) {
 		pc.Close()
 		return nil, fmt.Errorf("unexpected packet conn type %T", pc)
 	}
-	res.Conn = conn
-	return res, nil
+	l.Conn = conn
+	return l, nil
 }
 
-// OrigDstFromOOB returns the destination the sender addressed, read from the
-// control messages ReadMsgUDP returned.
-func OrigDstFromOOB(oob []byte) (*OriginalDst, error) {
+// Control is what one datagram's control messages carried.
+type Control struct {
+	OrigDst *OriginalDst
+	// Drops is the kernel's cumulative count of datagrams dropped on this
+	// socket for lack of buffer space; HasDrops reports whether it was sent.
+	Drops    uint32
+	HasDrops bool
+}
+
+// ParseControl reads the control messages returned by ReadMsgUDP. It returns
+// ErrNoOrigDst, with any drop count still set, when no original destination
+// was present.
+func ParseControl(oob []byte) (*Control, error) {
+	c := &Control{}
 	if len(oob) == 0 {
-		return nil, ErrNoOrigDst
+		return c, ErrNoOrigDst
 	}
 	msgs, err := syscall.ParseSocketControlMessage(oob)
 	if err != nil {
-		return nil, fmt.Errorf("parse control messages: %w", err)
+		return c, fmt.Errorf("parse control messages: %w", err)
 	}
 	for _, m := range msgs {
 		switch {
+		case m.Header.Level == syscall.SOL_SOCKET && m.Header.Type == soRxqOvfl && len(m.Data) >= 4:
+			c.Drops, c.HasDrops = binary.NativeEndian.Uint32(m.Data), true
 		case m.Header.Level == syscall.SOL_IP && m.Header.Type == ipRecvOrigDstAddr:
 			if len(m.Data) < syscall.SizeofSockaddrInet4 {
-				return nil, fmt.Errorf("short IPv4 original destination")
+				return c, errors.New("short IPv4 original destination")
 			}
 			a := (*syscall.RawSockaddrInet4)(unsafe.Pointer(&m.Data[0]))
 			p := (*[2]byte)(unsafe.Pointer(&a.Port))
-			ip := make(net.IP, 4)
-			copy(ip, a.Addr[:])
-			return &OriginalDst{IP: ip, Port: binary.BigEndian.Uint16(p[:])}, nil
+			c.OrigDst = &OriginalDst{IP: append(net.IP(nil), a.Addr[:]...), Port: binary.BigEndian.Uint16(p[:])}
 		case m.Header.Level == syscall.SOL_IPV6 && m.Header.Type == ipv6RecvOrigDst:
 			if len(m.Data) < syscall.SizeofSockaddrInet6 {
-				return nil, fmt.Errorf("short IPv6 original destination")
+				return c, errors.New("short IPv6 original destination")
 			}
 			a := (*syscall.RawSockaddrInet6)(unsafe.Pointer(&m.Data[0]))
 			p := (*[2]byte)(unsafe.Pointer(&a.Port))
-			ip := make(net.IP, 16)
-			copy(ip, a.Addr[:])
-			return &OriginalDst{IP: ip, Port: binary.BigEndian.Uint16(p[:])}, nil
+			c.OrigDst = &OriginalDst{IP: append(net.IP(nil), a.Addr[:]...), Port: binary.BigEndian.Uint16(p[:])}
 		}
 	}
-	return nil, ErrNoOrigDst
+	if c.OrigDst == nil {
+		return c, ErrNoOrigDst
+	}
+	return c, nil
 }

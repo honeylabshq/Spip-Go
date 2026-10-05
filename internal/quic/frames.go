@@ -1,6 +1,11 @@
 package quic
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+
+	"spip/internal/sanitize"
+)
 
 // Segment is one CRYPTO frame: a slice of the TLS handshake stream at Offset.
 type Segment struct {
@@ -10,42 +15,36 @@ type Segment struct {
 
 // Frames summarises a decrypted Initial payload.
 type Frames struct {
-	Crypto  []Segment
-	Padding int  // PADDING bytes
-	Pings   int  // PING frames
-	Acks    int  // ACK frames (a client's first flight normally has none)
-	Close   bool // CONNECTION_CLOSE present
-	// CloseReason is the reason phrase of a CONNECTION_CLOSE, bounded.
+	Crypto      []Segment
+	Pings       int
+	Close       bool
 	CloseReason string
 }
 
-// parseFrames reads the frame types allowed in an Initial packet (RFC 9000
-// table 3): PADDING, PING, ACK, CRYPTO and CONNECTION_CLOSE. Any other type is
-// a protocol violation in an Initial and stops the parse with an error, which
-// the caller records rather than guessing at the rest.
-//
-// Chrome splits its ClientHello into many CRYPTO frames, sends them out of
-// order and scatters PADDING and PING between them, so nothing here assumes
-// order; reassembly is by offset in Assembler.
+const (
+	maxAckRanges   = 256
+	maxCloseReason = 256
+)
+
+// parseFrames reads the frame types RFC 9000 allows in an Initial packet.
+// Order is not assumed: clients may scatter CRYPTO frames between PADDING and
+// PING, and reassembly is by offset.
 func parseFrames(b []byte) (*Frames, error) {
 	f := &Frames{}
 	for len(b) > 0 {
-		t := b[0]
-		switch {
-		case t == 0x00:
+		switch t := b[0]; t {
+		case 0x00:
 			b = b[1:]
-			f.Padding++
-		case t == 0x01:
+		case 0x01:
 			b = b[1:]
 			f.Pings++
-		case t == 0x02 || t == 0x03:
+		case 0x02, 0x03:
 			n, err := skipAck(b[1:], t == 0x03)
 			if err != nil {
 				return f, err
 			}
 			b = b[1+n:]
-			f.Acks++
-		case t == 0x06:
+		case 0x06:
 			off, n1, err := readVarint(b[1:])
 			if err != nil {
 				return f, err
@@ -56,17 +55,17 @@ func parseFrames(b []byte) (*Frames, error) {
 			}
 			start := 1 + n1 + n2
 			if ln > uint64(len(b)-start) {
-				return f, fmt.Errorf("CRYPTO frame beyond packet")
+				return f, errors.New("CRYPTO frame beyond packet")
 			}
-			f.Crypto = append(f.Crypto, Segment{Offset: off, Data: append([]byte(nil), b[start:start+int(ln)]...)})
-			b = b[start+int(ln):]
-		case t == 0x1c || t == 0x1d:
+			end := start + int(ln)
+			f.Crypto = append(f.Crypto, Segment{Offset: off, Data: append([]byte(nil), b[start:end]...)})
+			b = b[end:]
+		case 0x1c, 0x1d:
 			n, reason, err := readClose(b[1:], t == 0x1c)
 			if err != nil {
 				return f, err
 			}
-			f.Close = true
-			f.CloseReason = reason
+			f.Close, f.CloseReason = true, reason
 			b = b[1+n:]
 		default:
 			return f, fmt.Errorf("frame type 0x%02x not allowed in an Initial", t)
@@ -75,69 +74,60 @@ func parseFrames(b []byte) (*Frames, error) {
 	return f, nil
 }
 
+type varintReader struct {
+	b   []byte
+	off int
+}
+
+func (r *varintReader) next() (uint64, error) {
+	v, n, err := readVarint(r.b[r.off:])
+	r.off += n
+	return v, err
+}
+
 func skipAck(b []byte, ecn bool) (int, error) {
-	off := 0
-	read := func() (uint64, error) {
-		v, n, err := readVarint(b[off:])
-		off += n
-		return v, err
-	}
-	if _, err := read(); err != nil { // largest acknowledged
-		return 0, err
-	}
-	if _, err := read(); err != nil { // ack delay
-		return 0, err
-	}
-	count, err := read()
-	if err != nil {
-		return 0, err
-	}
-	if _, err := read(); err != nil { // first range
-		return 0, err
-	}
-	if count > 256 {
-		return 0, fmt.Errorf("implausible ACK range count %d", count)
-	}
-	for i := uint64(0); i < count*2; i++ {
-		if _, err := read(); err != nil {
+	r := &varintReader{b: b}
+	for i := 0; i < 2; i++ { // largest acknowledged, ack delay
+		if _, err := r.next(); err != nil {
 			return 0, err
 		}
 	}
+	count, err := r.next()
+	if err != nil {
+		return 0, err
+	}
+	if count > maxAckRanges {
+		return 0, fmt.Errorf("implausible ACK range count %d", count)
+	}
+	fields := 1 + 2*int(count) // first range, then gap and length pairs
 	if ecn {
-		for i := 0; i < 3; i++ {
-			if _, err := read(); err != nil {
-				return 0, err
-			}
+		fields += 3
+	}
+	for i := 0; i < fields; i++ {
+		if _, err := r.next(); err != nil {
+			return 0, err
 		}
 	}
-	return off, nil
+	return r.off, nil
 }
 
 func readClose(b []byte, transport bool) (int, string, error) {
-	off := 0
-	if _, n, err := readVarint(b[off:]); err != nil { // error code
+	r := &varintReader{b: b}
+	if _, err := r.next(); err != nil { // error code
 		return 0, "", err
-	} else {
-		off += n
 	}
 	if transport {
-		if _, n, err := readVarint(b[off:]); err != nil { // frame type
+		if _, err := r.next(); err != nil { // offending frame type
 			return 0, "", err
-		} else {
-			off += n
 		}
 	}
-	ln, n, err := readVarint(b[off:])
+	ln, err := r.next()
 	if err != nil {
 		return 0, "", err
 	}
-	off += n
-	if ln > uint64(len(b)-off) {
-		return 0, "", fmt.Errorf("CONNECTION_CLOSE reason beyond packet")
+	if ln > uint64(len(b)-r.off) {
+		return 0, "", errors.New("CONNECTION_CLOSE reason beyond packet")
 	}
-	reason := b[off : off+int(ln)]
-	if len(reason) > 256 {
-		reason = reason[:256]
-	}
-	return off + int(ln), string(reason), nil
+	reason := b[r.off : r.off+int(ln)]
+	return r.off + int(ln), sanitize.Printable(reason, maxCloseReason), nil
 }

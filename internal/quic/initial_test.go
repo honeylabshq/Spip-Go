@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-func unhexT(t *testing.T, s string) []byte {
+func unhexT(t testing.TB, s string) []byte {
 	t.Helper()
 	b, err := hex.DecodeString(strings.ReplaceAll(s, " ", ""))
 	if err != nil {
@@ -60,7 +60,7 @@ func TestClientInitialKeysRFC9369(t *testing.T) {
 
 // realHello asks Go's own QUIC-mode TLS client for its first flight, which is
 // exactly the ClientHello a QUIC client puts into CRYPTO frames.
-func realHello(t *testing.T, sni string, tp []byte) []byte {
+func realHello(t testing.TB, sni string, tp []byte) []byte {
 	t.Helper()
 	qc := tls.QUICClient(&tls.QUICConfig{TLSConfig: &tls.Config{
 		ServerName: sni, NextProtos: []string{"h3"}, MinVersion: tls.VersionTLS13,
@@ -107,7 +107,7 @@ func cryptoFrame(off uint64, data []byte) []byte {
 
 // sealInitial builds a protected client Initial the way a sender does: it is
 // written independently of unprotect() so the round trip checks both.
-func sealInitial(t *testing.T, version uint32, dcid, scid []byte, pn uint64, payload []byte) []byte {
+func sealInitial(t testing.TB, version uint32, dcid, scid []byte, pn uint64, payload []byte) []byte {
 	t.Helper()
 	vp := versions[version]
 	k, err := ClientInitialKeys(version, dcid)
@@ -232,7 +232,10 @@ func TestSplitOutOfOrderHello(t *testing.T) {
 	}
 	// The client retransmits because nothing answered: absorbed, not re-logged.
 	pkts, _ := ParseDatagram(d1)
-	if as.Add("src|dcid", now, pkts[0], d1, nil, true) != nil || as.Retransmits != 1 {
+	if _, r := as.Stats(); as.Add("src|dcid", now, pkts[0], d1, nil, true) != nil || r != 0 {
+		t.Fatal("unexpected state")
+	}
+	if _, r := as.Stats(); r != 1 {
 		t.Fatal("retransmission was not absorbed")
 	}
 }
@@ -264,8 +267,8 @@ func TestVersionNegotiationProbe(t *testing.T) {
 	d := []byte{0xc0, 0x1a, 0x2a, 0x3a, 0x4a, 8, 1, 2, 3, 4, 5, 6, 7, 8, 0}
 	d = append(d, make([]byte, 1200)...)
 	pkts, err := ParseDatagram(d)
-	if err != nil {
-		t.Fatalf("probe rejected: %v", err)
+	if !errors.Is(err, ErrUnsupportedVersion) || len(pkts) != 1 {
+		t.Fatalf("probe: %v %v", pkts, err)
 	}
 	if pkts[0].Version != 0x1a2a3a4a || pkts[0].Frames != nil || len(pkts[0].DCID) != 8 {
 		t.Fatalf("unexpected %+v", pkts[0])
@@ -313,8 +316,8 @@ func TestPendingIsBounded(t *testing.T) {
 	for i := 0; i < MaxPending+10; i++ {
 		as.Add(string(rune(i))+"k", time.Now(), pkts[0], d, nil, true)
 	}
-	if as.Pending() != MaxPending || as.Overflow != 10 {
-		t.Fatalf("pending %d overflow %d", as.Pending(), as.Overflow)
+	if o, _ := as.Stats(); as.Pending() != MaxPending || o != 10 {
+		t.Fatalf("pending %d overflow %d", as.Pending(), o)
 	}
 }
 

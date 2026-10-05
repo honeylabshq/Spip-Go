@@ -117,8 +117,7 @@ func main() {
 
 	fmt.Fprintf(os.Stderr, "Listening on %s\n", addr)
 
-	// UDP capture, when enabled. Started after TCP so a UDP failure cannot
-	// take the TCP sensor down: it is logged and the sensor carries on.
+	// A UDP failure is logged and must not take the TCP sensor down.
 	var udpServer *udp.Server
 	var udpConn *net.UDPConn
 	if cfg.UDPEnabled {
@@ -138,6 +137,8 @@ func main() {
 				CaptureClientHello: cfg.ShouldCaptureClientHello(),
 				RatePerSecond:      float64(cfg.UDPRateLimitPerSecond),
 				Burst:              cfg.UDPRateLimitBurst,
+				SourceRate:         float64(cfg.UDPSourceRateLimitPerSecond),
+				SourceBurst:        cfg.UDPSourceRateLimitBurst,
 			})
 			go func() {
 				if err := udpServer.Serve(udpConn); err != nil {

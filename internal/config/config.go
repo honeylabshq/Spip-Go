@@ -47,14 +47,14 @@ type Config struct {
 	// wants. Accepts bare addresses ("192.0.2.10") and CIDR ("192.0.2.0/24"),
 	// IPv4 or IPv6.
 	IgnoreSources []string `toml:"ignore_sources,omitempty"`
-	// UDP capture. Off by default: it needs a TPROXY rule on the host (see
-	// scripts/udp-capture.sh), not the nat REDIRECT the TCP side uses, and it
-	// never answers anything. udp_port defaults to port.
-	UDPEnabled            bool       `toml:"udp_enabled,omitempty"`
-	UDPPort               uint16     `toml:"udp_port,omitempty"`
-	UDPRateLimitPerSecond int        `toml:"udp_rate_limit_per_second,omitempty"`
-	UDPRateLimitBurst     int        `toml:"udp_rate_limit_burst,omitempty"`
-	Loom                  LoomConfig `toml:"loom,omitempty"`
+	// UDP capture needs the TPROXY rule from scripts/udp-capture.sh.
+	UDPEnabled                  bool       `toml:"udp_enabled,omitempty"`
+	UDPPort                     uint16     `toml:"udp_port,omitempty"` // defaults to port
+	UDPRateLimitPerSecond       int        `toml:"udp_rate_limit_per_second,omitempty"`
+	UDPRateLimitBurst           int        `toml:"udp_rate_limit_burst,omitempty"`
+	UDPSourceRateLimitPerSecond int        `toml:"udp_source_rate_limit_per_second,omitempty"`
+	UDPSourceRateLimitBurst     int        `toml:"udp_source_rate_limit_burst,omitempty"`
+	Loom                        LoomConfig `toml:"loom,omitempty"`
 
 	ignoreNets []netip.Prefix
 }
@@ -173,6 +173,14 @@ func (c *Config) Validate() error {
 	}
 	if (c.CertPath != "" && c.KeyPath == "") || (c.CertPath == "" && c.KeyPath != "") {
 		return fmt.Errorf("both cert_path and key_path must be provided for TLS")
+	}
+	for name, v := range map[string]int{
+		"udp_rate_limit_per_second": c.UDPRateLimitPerSecond, "udp_rate_limit_burst": c.UDPRateLimitBurst,
+		"udp_source_rate_limit_per_second": c.UDPSourceRateLimitPerSecond, "udp_source_rate_limit_burst": c.UDPSourceRateLimitBurst,
+	} {
+		if v < 0 {
+			return fmt.Errorf("%s must not be negative", name)
+		}
 	}
 	if c.Loom.Enabled {
 		if c.Loom.URL == "" {

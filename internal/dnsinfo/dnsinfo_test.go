@@ -114,3 +114,16 @@ func TestUnknownTypeNames(t *testing.T) {
 		t.Errorf("type %q", i.Questions[0].Type)
 	}
 }
+
+// Labels may carry any byte. They must reach records escaped, not raw.
+func TestNameIsSanitised(t *testing.T) {
+	b := h(t, `0001 0000 0001 0000 0000 0000
+		05 3c623e0a00 03 636f6d 00 0001 0001`)
+	i, err := Parse(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := i.Questions[0].Name; got != `<b>\x0a\x00.com` {
+		t.Errorf("name %q", got)
+	}
+}

@@ -1,9 +1,5 @@
-// Package dnsinfo decodes DNS messages that arrive at the sensor. Nothing is
-// answered: a honeypot that replies to DNS is an open resolver or an
-// amplifier. What is recorded is the question a scanner asked, which names the
-// thing it was looking for (a reflection test domain, an amplification-friendly
-// ANY query, a version.bind probe), and the EDNS shape, which differs between
-// tools.
+// Package dnsinfo decodes DNS messages received by the sensor. Nothing is
+// answered; the question and EDNS shape identify what a scanner looked for.
 package dnsinfo
 
 import (
@@ -11,17 +7,22 @@ import (
 	"strconv"
 	"strings"
 
+	"spip/internal/sanitize"
+
 	"golang.org/x/net/dns/dnsmessage"
 )
 
-// MaxQuestions bounds what is kept from one message. Real queries carry one.
-const MaxQuestions = 4
+const (
+	MaxQuestions   = 4
+	maxEDNSOptions = 16
+	maxNameBytes   = 255
+)
 
 // Question is one entry of the question section.
 type Question struct {
-	Name  string // without the trailing dot, as ECS dns.question.name
-	Type  string // "A", "ANY", "TXT", or "TYPE65" for types without a name
-	Class string // "IN", "CH" (version.bind), or "CLASS%d"
+	Name  string // no trailing dot; non-printable bytes escaped as \xNN
+	Type  string
+	Class string
 }
 
 // Info is the decoded message.
@@ -36,17 +37,15 @@ type Info struct {
 	Authority  int
 	Additional int
 
-	// EDNS(0) from the OPT record, when present.
 	EDNS        bool
 	EDNSUDPSize uint16
 	EDNSVersion uint8
-	EDNSDO      bool  // DNSSEC OK
-	EDNSOptions []int // option codes in order (8 client subnet, 10 cookie, ...)
+	EDNSDO      bool
+	EDNSOptions []int
 }
 
 // Parse decodes b as a DNS message. It fails unless the header and every
-// question parse, which keeps arbitrary binary probes from being labelled DNS
-// because their first twelve bytes happen to fit a header.
+// question parse, so binary probes are not labelled DNS by accident.
 func Parse(b []byte) (*Info, error) {
 	var p dnsmessage.Parser
 	h, err := p.Start(b)
@@ -83,15 +82,13 @@ func Parse(b []byte) (*Info, error) {
 			break
 		}
 		info.Questions = append(info.Questions, Question{
-			Name:  strings.TrimSuffix(q.Name.String(), "."),
+			Name:  displayName(q.Name),
 			Type:  typeName(q.Type),
 			Class: className(q.Class),
 		})
 	}
 
-	// Count the remaining sections and find the OPT record. A malformed
-	// record after the question still leaves a valid query, so errors past
-	// this point end the walk without discarding what was decoded.
+	// A malformed record after the questions ends the walk but keeps the query.
 	if n, err := countSection(&p, p.AnswerHeader, p.SkipAnswer); err == nil {
 		info.Answers = n
 	} else {
@@ -118,7 +115,7 @@ func Parse(b []byte) (*Info, error) {
 				break
 			}
 			for _, o := range res.Options {
-				if len(info.EDNSOptions) < 16 {
+				if len(info.EDNSOptions) < maxEDNSOptions {
 					info.EDNSOptions = append(info.EDNSOptions, int(o.Code))
 				}
 			}
@@ -147,8 +144,7 @@ func countSection(p *dnsmessage.Parser, header func() (dnsmessage.ResourceHeader
 	}
 }
 
-// Summary is the one-line text stored as event.summary, which is what the
-// site's search and payload views show for non-HTTP events.
+// Summary is the one-line text stored as event.summary.
 func (i *Info) Summary() string {
 	kind := "query"
 	if i.Response {
@@ -174,6 +170,11 @@ func (i *Info) Summary() string {
 		}
 	}
 	return b.String()
+}
+
+func displayName(n dnsmessage.Name) string {
+	b := n.Data[:min(int(n.Length), len(n.Data))]
+	return strings.TrimSuffix(sanitize.Printable(b, maxNameBytes), ".")
 }
 
 func typeName(t dnsmessage.Type) string {
