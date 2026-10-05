@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"spip/internal/config"
@@ -63,6 +65,7 @@ const (
 //	               alone and is dropped with a clear message rather than
 //	               poisoning everything batched alongside it.
 //	5xx, transport transient. Back off and retry.
+//	429            Loom's request or event budget; wait for Retry-After and retry.
 //	4xx other      a bad token or a malformed body cannot succeed on retry, so
 //	               drop immediately rather than spend attempts on it.
 func (s *Shipper) send(batch []map[string]interface{}, depth int) {
@@ -95,6 +98,7 @@ func (s *Shipper) send(batch []map[string]interface{}, depth int) {
 			continue
 		}
 		status := resp.StatusCode
+		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
 		resp.Body.Close()
 
 		switch {
@@ -115,6 +119,11 @@ func (s *Shipper) send(batch []map[string]interface{}, depth int) {
 			s.send(batch[mid:], depth+1)
 			return
 
+		case status == http.StatusTooManyRequests:
+			s.onError(fmt.Sprintf("loom POST: rate limited (attempt %d/%d)", attempt+1, maxSendAttempts))
+			time.Sleep(retryAfter)
+			continue
+
 		case status >= 500:
 			s.onError(fmt.Sprintf("loom POST: status %d (attempt %d/%d)", status, attempt+1, maxSendAttempts))
 			continue
@@ -128,6 +137,18 @@ func (s *Shipper) send(batch []map[string]interface{}, depth int) {
 		}
 	}
 	s.onError(fmt.Sprintf("loom POST: giving up after %d attempts, dropping %d events", maxSendAttempts, len(batch)))
+}
+
+// maxRetryAfter bounds how long one rate-limited batch can hold the shipper.
+const maxRetryAfter = 10 * time.Second
+
+// parseRetryAfter reads a delay in seconds; dates and junk fall back to 1s.
+func parseRetryAfter(v string) time.Duration {
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n <= 0 {
+		return time.Second
+	}
+	return min(time.Duration(n)*time.Second, maxRetryAfter)
 }
 
 func (s *Shipper) Run() (chan<- map[string]interface{}, <-chan struct{}) {
