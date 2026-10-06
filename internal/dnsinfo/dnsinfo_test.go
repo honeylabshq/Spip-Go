@@ -127,3 +127,82 @@ func TestNameIsSanitised(t *testing.T) {
 		t.Errorf("name %q", got)
 	}
 }
+
+// Real datagrams captured on 2026-10-05 and 06 whose first twelve bytes read as
+// a DNS header. Each was recorded as DNS before framing was checked.
+func TestOtherProtocolsAreNotDNS(t *testing.T) {
+	for _, c := range []struct{ name, hex string }{
+		{"Sun RPC portmap call", "1aa9ffe10000000000000002000186a0000000020000000400000000000000000000000000000000"},
+		{"NTP client request", "e30004fa000100000001000000000000000000000000000000000000000000000000000000000000c54f234b71b152f3"},
+		{"DTLS ClientHello", "16feff000000000000000000660100005a000000000000005afefd29352bf9c774a89a12bf07b27bfdd2b977631f9e9b889418188a1b646061e43800000032c02ccca9c0adc00ac02bc0acc009c030cca8c014c02fc013009dc09d0035009cc09c002f009fccaac09f0039009ec09e00330100"},
+		{"RIP request", "01010000000200004400000000000000000000000000000f"},
+		{"IPMI RMCP ping", "0600ff07000000000000000000092018c88100388e04b5"},
+		{"RPC to port 1629", "1a09faba000000000000000255555555000000010000000100000000000000000000000000000000ffff55120000003c00000001000000020000000000000000"},
+	} {
+		if i, err := Parse(h(t, c.hex)); err == nil {
+			t.Errorf("%s parsed as DNS: %q", c.name, i.Summary())
+		}
+	}
+}
+
+func TestRealQueriesStillParse(t *testing.T) {
+	for _, c := range []struct{ hex, summary string }{
+		{"1271010000010000000000010477697363036564750000ff00010000292000000080000000", "DNS query ANY wisc.edu"},
+		{"000000000001000000000000095f7365727669636573075f646e732d7364045f756470056c6f63616c00000c0001", "DNS query PTR _services._dns-sd._udp.local"},
+	} {
+		i, err := Parse(h(t, c.hex))
+		if err != nil {
+			t.Fatalf("%s: %v", c.summary, err)
+		}
+		if i.Summary() != c.summary {
+			t.Errorf("summary %q, want %q", i.Summary(), c.summary)
+		}
+	}
+}
+
+// The node status probe scanners send to 137/udp: the wildcard name "*",
+// type NBSTAT (0x21, which DNS would read as SRV).
+func TestNetBIOSNodeStatus(t *testing.T) {
+	i, err := Parse(h(t, "35370100000100000000000020434b4141414141414141414141414141414141414141414141414141414141410000210001"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if i.NetBIOS == nil || i.NetBIOS.Name != "*" || i.NetBIOS.Type != "NBSTAT" {
+		t.Fatalf("netbios %+v", i.NetBIOS)
+	}
+	if i.Summary() != "NetBIOS node status query *" {
+		t.Errorf("summary %q", i.Summary())
+	}
+}
+
+func TestQuestionTypeAndClassMustBeValid(t *testing.T) {
+	for _, s := range []string{
+		"0001 0100 0001 0000 0000 0000 07 6578616d706c65 03 636f6d 00 0000 0001",            // type 0
+		"0001 0100 0001 0000 0000 0000 07 6578616d706c65 03 636f6d 00 0001 0000",            // class 0
+		"0001 0100 0001 0000 0000 0000 07 6578616d706c65 03 636f6d 00 0001 0001 ff",         // trailing data
+		"0001 0100 0001 0000 0000 0000 07 6578616d706c65 03 636f6d 00 0001 0001 0000000000", // five padding bytes
+		"0001 1800 0001 0000 0000 0000 07 6578616d706c65 03 636f6d 00 0001 0001",            // opcode 3
+		"0001 8180 0000 0001 0000 0000 c00c 0001 0001 0000012c 0004 5db8d822",               // answer, no question
+	} {
+		if _, err := Parse(h(t, s)); err == nil {
+			t.Errorf("%s parsed as DNS", s)
+		}
+	}
+	// mDNS sets the top class bit to ask for a unicast answer.
+	if _, err := Parse(h(t, "0000 0000 0001 0000 0000 0000 05 5f68747470 04 5f746370 05 6c6f63616c 00 000c 8001")); err != nil {
+		t.Errorf("mDNS unicast-response question rejected: %v", err)
+	}
+}
+
+// Seen on 53/udp: version.bind probes with a newline or a zero byte appended.
+func TestProbePaddingIsToleratedAndCounted(t *testing.T) {
+	for _, tail := range []string{"0a", "00", "0d0a"} {
+		i, err := Parse(h(t, "34ef 0100 0001 0000 0000 0000 07 76657273696f6e 04 62696e64 00 0010 0003"+tail))
+		if err != nil {
+			t.Fatalf("tail %s: %v", tail, err)
+		}
+		if i.Trailing != len(tail)/2 || i.Summary() != "DNS query TXT/CH version.bind" {
+			t.Errorf("tail %s: trailing %d, summary %q", tail, i.Trailing, i.Summary())
+		}
+	}
+}

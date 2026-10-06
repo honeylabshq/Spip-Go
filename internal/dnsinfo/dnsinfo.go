@@ -3,6 +3,8 @@
 package dnsinfo
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -16,7 +18,12 @@ const (
 	MaxQuestions   = 4
 	maxEDNSOptions = 16
 	maxNameBytes   = 255
+	maxRecords     = 32
+	maxTrailing    = 4
 )
+
+// ErrNotDNS means the datagram is not a well-formed DNS message.
+var ErrNotDNS = errors.New("not a DNS message")
 
 // Question is one entry of the question section.
 type Question struct {
@@ -42,17 +49,45 @@ type Info struct {
 	EDNSVersion uint8
 	EDNSDO      bool
 	EDNSOptions []int
+
+	// Trailing counts bytes after the message: zeros, CR or LF that some
+	// probing tools append. It identifies the tool, not the question.
+	Trailing int
+
+	// NetBIOS is set for a NetBIOS name service packet (RFC 1002). It shares
+	// the DNS wire format but names a NetBIOS name, not a domain.
+	NetBIOS *NetBIOS
 }
 
-// Parse decodes b as a DNS message. It fails unless the header and every
-// question parse, so binary probes are not labelled DNS by accident.
+// NetBIOS is the decoded first question of a NetBIOS name service packet.
+type NetBIOS struct {
+	Name   string // "*" for the wildcard used by node status probes
+	Suffix uint8  // the 16th byte: the service type
+	Type   string // "NB" (name query) or "NBSTAT" (node status)
+}
+
+// Parse decodes b as a DNS message. It fails unless b is exactly one message
+// (header, at least one question, and every record the counts announce,
+// ending at the last byte) with a valid opcode, question type and class.
+// Binary probes for other services often begin with twelve bytes that read as
+// a DNS header; framing the whole datagram is what tells them apart.
 func Parse(b []byte) (*Info, error) {
+	end := framedLen(b)
+	if end < 0 || !padding(b[end:]) {
+		return nil, ErrNotDNS
+	}
 	var p dnsmessage.Parser
 	h, err := p.Start(b)
 	if err != nil {
 		return nil, err
 	}
+	switch h.OpCode {
+	case 0, 1, 2, 4, 5: // QUERY, IQUERY, STATUS, NOTIFY, UPDATE
+	default:
+		return nil, ErrNotDNS
+	}
 	info := &Info{
+		Trailing: len(b) - end,
 		ID:       h.ID,
 		Response: h.Response,
 		OpCode:   opCodeName(h.OpCode),
@@ -74,8 +109,10 @@ func Parse(b []byte) (*Info, error) {
 	if err != nil {
 		return nil, fmt.Errorf("questions: %w", err)
 	}
-	if !info.Response && len(qs) == 0 {
-		return nil, fmt.Errorf("query without a question")
+	for _, q := range qs {
+		if q.Type == 0 || !validClass(q.Class) {
+			return nil, ErrNotDNS
+		}
 	}
 	for i, q := range qs {
 		if i == MaxQuestions {
@@ -88,7 +125,13 @@ func Parse(b []byte) (*Info, error) {
 		})
 	}
 
-	// A malformed record after the questions ends the walk but keeps the query.
+	if nb := netBIOS(qs[0]); nb != nil {
+		info.NetBIOS = nb
+		info.Questions[0].Name, info.Questions[0].Type = nb.Name, nb.Type
+	}
+
+	// A record whose content does not decode ends the walk but keeps the
+	// query; its framing was already checked above.
 	if n, err := countSection(&p, p.AnswerHeader, p.SkipAnswer); err == nil {
 		info.Answers = n
 	} else {
@@ -144,8 +187,129 @@ func countSection(p *dnsmessage.Parser, header func() (dnsmessage.ResourceHeader
 	}
 }
 
+// framedLen returns the length of the DNS message at the start of b, or -1
+// unless the header, the questions and every record its counts announce fit.
+func framedLen(b []byte) int {
+	if len(b) < 12 {
+		return -1
+	}
+	qd := int(binary.BigEndian.Uint16(b[4:]))
+	rr := int(binary.BigEndian.Uint16(b[6:])) + int(binary.BigEndian.Uint16(b[8:])) + int(binary.BigEndian.Uint16(b[10:]))
+	if qd < 1 || qd > MaxQuestions || rr > maxRecords {
+		return -1
+	}
+	off := 12
+	for i := 0; i < qd; i++ {
+		if off = skipName(b, off); off < 0 || off+4 > len(b) {
+			return -1
+		}
+		off += 4
+	}
+	for i := 0; i < rr; i++ {
+		if off = skipName(b, off); off < 0 || off+10 > len(b) {
+			return -1
+		}
+		off += 10 + int(binary.BigEndian.Uint16(b[off+8:]))
+		if off > len(b) {
+			return -1
+		}
+	}
+	return off
+}
+
+// padding accepts what probing tools have been seen to append after a
+// message: at most a few zero, CR or LF bytes.
+func padding(t []byte) bool {
+	if len(t) > maxTrailing {
+		return false
+	}
+	for _, c := range t {
+		if c != 0 && c != '\r' && c != '\n' {
+			return false
+		}
+	}
+	return true
+}
+
+// skipName returns the offset after the name at off, or -1. A compression
+// pointer must point back into the message, before the name it ends.
+func skipName(b []byte, off int) int {
+	start, total := off, 0
+	for {
+		if off >= len(b) {
+			return -1
+		}
+		c := int(b[off])
+		switch {
+		case c == 0:
+			return off + 1
+		case c&0xC0 == 0xC0:
+			if off+1 >= len(b) {
+				return -1
+			}
+			if ptr := (c&0x3F)<<8 | int(b[off+1]); ptr < 12 || ptr >= start {
+				return -1
+			}
+			return off + 2
+		case c&0xC0 != 0:
+			return -1
+		}
+		if total += c + 1; total > maxNameBytes {
+			return -1
+		}
+		off += 1 + c
+	}
+}
+
+// validClass accepts IN, CH, HS, NONE and ANY. The top bit is mDNS's
+// unicast-response flag, not part of the class.
+func validClass(c dnsmessage.Class) bool {
+	switch c & 0x7fff {
+	case 1, 3, 4, 254, 255:
+		return true
+	}
+	return false
+}
+
+// netBIOS decodes a NetBIOS name service question: a 32-character first
+// label in RFC 1001 first-level encoding (each byte as two letters A-P),
+// type NB (0x20) or NBSTAT (0x21), class IN.
+func netBIOS(q dnsmessage.Question) *NetBIOS {
+	if q.Class&0x7fff != 1 || (q.Type != 0x20 && q.Type != 0x21) {
+		return nil
+	}
+	label, _, _ := strings.Cut(string(q.Name.Data[:q.Name.Length]), ".")
+	if len(label) != 32 {
+		return nil
+	}
+	raw := make([]byte, 16)
+	for i := 0; i < 16; i++ {
+		hi, lo := label[2*i]-'A', label[2*i+1]-'A'
+		if hi > 15 || lo > 15 {
+			return nil
+		}
+		raw[i] = hi<<4 | lo
+	}
+	nb := &NetBIOS{Suffix: raw[15], Type: "NB"}
+	if q.Type == 0x21 {
+		nb.Type = "NBSTAT"
+	}
+	if raw[0] == '*' {
+		nb.Name = "*"
+	} else {
+		nb.Name = sanitize.Printable([]byte(strings.TrimRight(string(raw[:15]), " ")), 15)
+	}
+	return nb
+}
+
 // Summary is the one-line text stored as event.summary.
 func (i *Info) Summary() string {
+	if nb := i.NetBIOS; nb != nil {
+		if nb.Type == "NBSTAT" {
+			return "NetBIOS node status query " + nb.Name
+		}
+		return fmt.Sprintf("NetBIOS name query %s<%02x>", nb.Name, nb.Suffix)
+	}
 	kind := "query"
 	if i.Response {
 		kind = "response"

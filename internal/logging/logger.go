@@ -502,6 +502,9 @@ func dnsECS(d *dnsinfo.Info) map[string]interface{} {
 	if d.Answers > 0 || d.Authority > 0 || d.Additional > 0 {
 		out["counts"] = map[string]interface{}{"answers": d.Answers, "authority": d.Authority, "additional": d.Additional}
 	}
+	if d.Trailing > 0 {
+		out["trailing_bytes"] = d.Trailing
+	}
 	if d.EDNS {
 		e := map[string]interface{}{"udp_size": d.EDNSUDPSize, "version": d.EDNSVersion, "do": d.EDNSDO}
 		if len(d.EDNSOptions) > 0 {
