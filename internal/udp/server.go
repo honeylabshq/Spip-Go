@@ -288,6 +288,12 @@ func (s *Server) HandleDatagram(payload []byte, src *net.UDPAddr, dst *socket.Or
 	if info, err := dnsinfo.Parse(payload); err == nil {
 		rec.NetworkProtocol = "dns"
 		rec.DNS = info
+		if info.NetBIOS != nil {
+			// Same wire format, different service: NetBIOS names are not
+			// domain names and must not land in the DNS question fields.
+			rec.NetworkProtocol = "netbios"
+			rec.DNS = nil
+		}
 		rec.Payload = info.Summary()
 	} else {
 		rec.Payload = string(payload[:min(len(payload), MaxStoredPayload)])

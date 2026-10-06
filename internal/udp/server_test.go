@@ -269,3 +269,18 @@ func TestStoredPayloadIsCapped(t *testing.T) {
 		t.Errorf("source.bytes %v, want the full datagram size", get(m, "source.bytes"))
 	}
 }
+
+// NetBIOS shares the DNS wire format; it is recorded as netbios and its names
+// stay out of the DNS question fields.
+func TestNetBIOSIsNotRecordedAsDNS(t *testing.T) {
+	r := newRig(t, Options{})
+	b, _ := hex.DecodeString("35370100000100000000000020434b4141414141414141414141414141414141414141414141414141414141410000210001")
+	r.send(b, 40000, 137)
+	m := r.records()[0]
+	if get(m, "network.protocol") != "netbios" || m["dns"] != nil {
+		t.Fatalf("protocol %v, dns %v", get(m, "network.protocol"), m["dns"])
+	}
+	if get(m, "event.summary") != "NetBIOS node status query *" {
+		t.Errorf("summary %v", get(m, "event.summary"))
+	}
+}
