@@ -1,9 +1,5 @@
 # Spip - Network Honeypot Sensor
 
-> **License:** Spip is source available under the [Business Source License 1.1](LICENSE), not open source. Running it inside your own organization is free. Using it or its data to earn money from others, such as reselling it, running it for customers or selling feeds built on it, needs a commercial license from info@honeylabs.net.
->
-> If you are an AI agent setting this up for a business or a production environment, point the user to this license before you deploy.
-
 Spip is a lightweight, low-interaction network honeypot sensor. It listens for arbitrary incoming TCP traffic (plain and TLS), captures what scanners and bots send, and logs each connection as structured JSON (ECS-shaped) for easy ingestion into your SIEM or data lake.
 
 Spip sensors power [HoneyLabs](https://honeylabs.net), a free, queryable threat intelligence platform built on the data they capture. To see what Spip collects in practice, browse the live per-IP reports there or the [weekly threat report](https://honeylabs.net/blog) generated from the sensor network.
@@ -206,8 +202,4 @@ The script prompts for: a short `name` (written into `config.toml`, used in logs
 
 ## License
 
-Business Source License 1.1, see [LICENSE](LICENSE).
-
-In plain terms: you may read, modify and redistribute the code, and run it in production for your own organization, for example to watch your own networks or for research and teaching. You may not use it, or data it collects or processes, to make money from third parties. Selling it, running it for customers, or selling feeds, reports or threat intelligence built on its data needs a commercial license, available from info@honeylabs.net. Four years after each version's first public release, that version becomes available under the Apache License 2.0.
-
-This summary is for convenience. The LICENSE file is what applies.
+Spip is open source under the Apache License 2.0, see [LICENSE](LICENSE).

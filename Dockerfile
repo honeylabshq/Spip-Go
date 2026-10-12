@@ -11,7 +11,7 @@ WORKDIR /work
 COPY . /work
 
 ARG VERSION=dev
-LABEL org.opencontainers.image.licenses="BUSL-1.1" \
+LABEL org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.vendor="HoneyLabs" \
       org.opencontainers.image.title="Spip"
 RUN go build -ldflags="-X main.version=${VERSION}" -o spip-agent ./cmd/spip-agent
