@@ -32,7 +32,7 @@ iptables -t nat -F
 # Run the tests (use the `e2e` build tag).
 # E2E validates core behaviour (payload, source/dest, TLS, Loom). Fingerprinting adds extra ECS fields only.
 echo "Running end-to-end tests with race detection..."
-if [ -n "$1" ]; then
+if [ -n "${1:-}" ]; then
     echo "Running test: $1"
     go test -v -race -timeout 30s -tags=e2e ./test/e2e/... -run "$1"
 else

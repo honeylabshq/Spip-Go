@@ -55,7 +55,7 @@ const (
 // 500, or a 413 all silently discarded up to batch_size events, and a Loom
 // restart lost whatever was in flight. This is the only hop in the pipeline
 // without an at-least-once story (Loom keeps a durable outbox for its own
-// writes to ClickHouse), so a retry here is what makes the chain whole.
+// downstream writes), so a retry here is what makes the chain whole.
 //
 // The three cases are deliberately different:
 //
