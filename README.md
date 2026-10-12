@@ -1,17 +1,15 @@
 # Spip - Network Honeypot Sensor
 
-Spip is a lightweight, low-interaction network honeypot sensor. It listens for arbitrary incoming TCP traffic (plain and TLS), captures what scanners and bots send, and logs each connection as structured JSON (ECS-shaped) for easy ingestion into your SIEM or data lake.
+Spip is a low-interaction network honeypot sensor for Linux, written in Go. It accepts TCP connections on any port the host redirects to it, plain or TLS, answers just enough to make a client send its next message, and writes each exchange as one JSON record with ECS field names, ready for a SIEM or data lake. Optional UDP capture records datagrams and never answers them.
 
-Spip sensors power [HoneyLabs](https://honeylabs.net), a free, queryable threat intelligence platform built on the data they capture. To see what Spip collects in practice, browse the live per-IP reports there or the [weekly threat report](https://honeylabs.net/blog) generated from the sensor network.
-
-
+HoneyLabs runs Spip to collect the data published on [honeylabs.net](https://honeylabs.net).
 
 ## Quick Start
 
-**Prerequisites**
-- Go 1.24.0 or later
-- Linux with `iptables`
-- Root access (required to apply the example iptables rules)
+Prerequisites:
+- Linux. The agent uses Linux socket options and does not build for other systems.
+- Go 1.27 or later
+- `iptables` and root access to install the redirect rules
 
 1) Build the agent
 ```bash
@@ -19,112 +17,158 @@ git clone https://github.com/honeylabshq/Spip-Go.git
 cd Spip-Go
 go build -o spip-agent ./cmd/spip-agent
 ```
+To set the version reported in `observer.version` and `agent.version` (default `dev`), add `-ldflags "-X main.version=v1.2.3"`.
 
 2) (Optional) Use the interactive setup helper
 ```bash
 sudo ./scripts/initial_setup.sh
 ```
-This helper writes a `config.toml` (it prompts for a short `name` used in logs), can generate self-signed TLS keys, optionally configures Loom (URL, sensor_id, token, etc.), and optionally applies the PREROUTING iptables redirect used in examples below.
+See [Initial setup helper](#initial-setup-helper) below.
 
 3) Create or edit `config.toml`
 Minimal `config.toml`:
 ```toml
 name = "spip-agent"
-ip = "127.0.0.1"
+ip = "0.0.0.0"
 port = 8080
 ```
 
 Optional configuration keys:
-- `cert_path` / `key_path`: enable TLS if both set; may be relative to the config file (the setup script writes relative paths so the config works from any working directory)
-- **Log output:** `log_file` (local) and/or `[loom]` (remote). See [Log output](#log-output) below.
-- `read_timeout_seconds` / `write_timeout_seconds`: connection timeouts
-- `rate_limit_per_second` / `rate_limit_burst`: connection rate-limiting
-- `community_id_seed`: optional 16-bit seed for Community ID v1 flow hashing (omit or `0` for default)
-- `ignore_sources` - addresses or networks whose connections are closed before anything is read, so they are never logged, fingerprinted or shipped. Bare addresses and CIDR, IPv4 or IPv6:
-  `ignore_sources = ["192.0.2.10", "198.51.100.0/24", "2001:db8::/32"]`. A honeypot on a rented host gets polled by that host's own monitoring, and those scrapes are not attacks: counted, they distort port rankings and scanner counts, and they cost storage for records nobody wants. An entry that does not parse stops the agent starting, because a typo here silently records traffic you believe is dropped.
+- `cert_path` / `key_path`: enable TLS if both are set. Relative paths resolve against the directory of the config file.
+- `log_file`: append records to this file instead of stdout. See [Log output](#log-output) below.
+- `[loom]`: also ship records over HTTP. See [Loom](#loom-optional-log-shipping) below.
+- `read_timeout_seconds` / `write_timeout_seconds`: idle read timeout and write timeout per connection.
+- `rate_limit_per_second` / `rate_limit_burst`: rate limit on new TCP connections, shared by all sources. A connection over the limit is closed unread.
+- `community_id_seed`: optional 16-bit seed for Community ID v1 flow hashing (omit or `0` for the default).
+- `capture_client_hello`: set `false` to leave out `tls.client.hello_hex`. See [Fingerprinting](#fingerprinting).
+- `ignore_sources`: addresses or networks whose connections and datagrams are closed or discarded before anything is read, so they are never logged, fingerprinted or shipped. Bare addresses and CIDR, IPv4 or IPv6:
+  `ignore_sources = ["192.0.2.10", "198.51.100.0/24", "2001:db8::/32"]`. A honeypot on a rented host gets polled by that host's own monitoring, and counting those scrapes distorts port rankings and scanner counts. An entry that does not parse stops the agent from starting, because a typo here would silently record traffic you believe is dropped. Drops are counted per source and reported in the log every hour and at shutdown.
+- `udp_enabled` and the `udp_*` keys: see [UDP capture](#udp-capture-dns-and-quic).
 
 If these runtime tuning fields are omitted or set to `0`, Spip applies the following defaults:
 - `read_timeout_seconds`: 30
 - `write_timeout_seconds`: 10
 - `rate_limit_per_second`: 20
 - `rate_limit_burst`: 50000
+
 4) Redirect incoming TCP to the agent (example, excluding SSH)
 ```bash
 sudo iptables -t nat -F
 sudo iptables -t nat -A PREROUTING -p tcp --dport 22 -j RETURN
 sudo iptables -t nat -A PREROUTING -p tcp -j REDIRECT --to-port 8080
 ```
+The first command flushes the whole nat table. Leave it out on a host that has NAT rules of its own. The same two rules with `ip6tables` cover IPv6. Spip reads each connection's original destination from the kernel's connection tracking and records it as `destination.ip` and `destination.port`.
 
 5) Run the agent
 ```bash
 ./spip-agent -config config.toml
 ```
+`-config` is the only flag and defaults to `config.toml` in the working directory. SIGINT or SIGTERM stops the listener, waits up to 15 seconds for open connections and flushes any pending Loom batch.
+
+## Responses
+
+Spip picks a responder by the original destination port. Each one says only enough to make the client send its next message: credentials, a command or a mail envelope.
+
+| Ports | Response |
+|-------|----------|
+| 23, 2323 | Telnet option negotiation and a `login:` prompt, then `Password:`, then `Login incorrect` and close |
+| 21, 990 | FTP greeting, a password request after the first line, then `530 Login incorrect.` and close |
+| 25, 465, 587 | SMTP greeting, `250` replies to the first three lines, `354` to the fourth, then close. Nothing is relayed and no outbound connection is made. |
+| 110, 995 | POP3 greeting, `+OK` after the first line, `-ERR invalid login` after the second, then close |
+| 143, 993 | IMAP greeting, then `* BAD Login failed` and close |
+| 6379, 6380, or any payload that looks like a Redis command | `+PONG` to PING, `+OK` to everything else |
+| any other port | `HTTP/1.1 200 OK` with the client's IP address as the body for an HTTP request, the bare IP address for anything else |
+
+A client that sends `SSH-2.0` without a key exchange message gets the banner `SSH-2.0-spip`, and Spip waits up to 2 seconds for the key exchange so it can compute the client fingerprint.
+
+The telnet, FTP, SMTP, POP3 and IMAP greetings are sent on connect. With TLS enabled, Spip first reads one byte to tell TLS from plain text, so those greetings only go out after the client has sent something.
 
 ## Log output
 
-Spip writes ECS logs to a **single local destination** and can **optionally** send the same logs to a Loom server:
+Spip writes ECS logs to a single local destination and can also send the same records to a Loom server:
 
 | Destination | Config | Behaviour |
 |-------------|--------|-----------|
-| **Local** | `log_file` | **Default:** omit or leave empty → **stdout**. Set to a path → that file. One of the two, always on. |
-| **Loom** | `[loom]` with `enabled = true` | Optional. Same events are batched and POSTed to your Loom ingest URL in addition to local. |
+| Local | `log_file` | Omitted or empty: stdout. Set to a path: records are appended to that file. Always on. |
+| Loom | `[loom]` with `enabled = true` | Optional. The same records are batched and POSTed to your Loom ingest URL in addition to the local output. |
 
-So: local defaults to stdout; override with `log_file` for a file. Optionally add Loom on top. Both use the same ECS format.
-
-- **Local only:** leave `log_file` commented/empty (stdout) or set it to a path.
-- **Local + Loom:** set local as above and add a `[loom]` section with `url`, `sensor_id`, `token` (see [Loom](#loom-optional-log-shipping) below).
+The local output also carries the agent's own log lines, such as hourly drop counts and warnings, as `{"timestamp": <unix seconds>, "level": "INFO", "message": "...", "target": "...", "record_type": "log"}`. Only connection records go to Loom. Startup messages go to stderr.
 
 ## Log format
-Spip emits each connection as a single JSON object. The output is formatted to be ECS-compatible using only the fields Spip can provide (no ASN/geo enrichment). Typical fields produced include:
-- `@timestamp`: RFC3339 timestamp for the event
-- `event.id`: per-connection session identifier
-- `observer.hostname` / `host.name`: agent `name` from config
-- `source.ip`, `source.port` and `destination.ip`, `destination.port`
-- `network.transport`: e.g. `tcp`
-- `http.request.body` / `url.path`: when the payload clearly resembles HTTP
-- `user_agent.original`: when available
-- `event.summary`: raw payload for non-HTTP probes
-- `event.original_payload_hex`: raw payload hex (always preserved)
-- [Fingerprinting](#fingerprinting) (built-in) adds `network.community_id`, `tls.client.*`, `ssh.client.hash.hassh`, `http.request.hash.akin` when applicable.
 
-Example (ECS-shaped) record produced by Spip:
+Spip writes each record as a single line of JSON with ECS field names, using only what it can derive from the connection itself (no ASN or geo enrichment). A connection that sends several messages produces one record per message, all with the same `event.id`. Fields include:
+- `@timestamp`: RFC 3339 time of the record, in whole seconds
+- `event.id`: per-connection session identifier; `event.sequence`: the record's position in the session, starting at 1
+- `event.duration`: nanoseconds since the connection opened
+- `event.module`, `event.dataset` (`spip.tcp` or `spip.udp`), `event.kind`, `event.category`, `event.type`: let a SIEM select Spip's records
+- `observer.vendor`, `observer.product`, `observer.type`, `observer.version`, `agent.type`, `agent.version`
+- `observer.hostname`, `observer.id` and `host.name`: the agent `name` from config
+- `source.ip`, `source.port`, `destination.ip`, `destination.port`
+- `source.bytes`, `destination.bytes`, `network.bytes`: bytes received and sent in the session so far
+- `network.transport` (`tcp` or `udp`) and `network.protocol` (`tls`, `dns`, `netbios` or `quic`) where known
+- `http.request.method`, `http.request.headers`, `http.request.body.content`, `http.request.body.bytes`, `url.path`, `url.domain`, `url.port`: when the payload is an HTTP request
+- `user_agent.original`: when available
+- `event.summary`: the payload as text, for payloads that are not HTTP requests
+- `event.original_payload_hex`: the raw payload in hex, always kept
+- [Fingerprinting](#fingerprinting) adds `network.community_id`, `tls.client.*`, `ssh.client.hash.hassh` and `http.request.hash.akin` when they apply.
+
+Example record, pretty-printed:
 ```json
 {
-  "@timestamp": "2025-12-01T19:35:18.123Z",
+  "@timestamp": "2026-10-12T09:14:03Z",
+  "agent": {"type": "spip", "version": "dev"},
+  "destination": {"bytes": 78, "ip": "203.0.113.10", "port": 80},
   "event": {
-    "id": "bd30cdc1-95b0-49aa-b8fe-e77230b6a04f",
-    "summary": "BitTorrent protocol",
-    "original_payload_hex": "426974546f7272656e742070726f746f636f6c",
-    "ingested_by": "spip"
+    "category": ["network", "intrusion_detection"],
+    "dataset": "spip.tcp",
+    "duration": 100000000,
+    "id": "3f0c9a52-6d1e-4b8a-9c27-5e41b7d08a6f",
+    "ingested_by": "spip",
+    "kind": "event",
+    "module": "spip",
+    "original_payload_hex": "474554202f2e656e7620485454502f312e310d0a486f73743a203230332e302e3131332e31300d0a557365722d4167656e743a204d6f7a696c6c612f352e300d0a4163636570743a202a2f2a0d0a436f6e6e656374696f6e3a20636c6f73650d0a0d0a",
+    "sequence": 1,
+    "type": ["connection", "info"]
   },
-  "observer": {"hostname": "spip-agent"},
-  "host": {"name": "spip-agent"},
-  "source": {"ip": "198.51.100.23", "port": 35882},
-  "destination": {"ip": "203.0.113.40", "port": 6881},
-  "network": {"transport": "tcp"}
+  "host": {"name": "example-sensor"},
+  "http": {
+    "request": {
+      "hash": {"akin": "b11cun040_00040015_4c87b06e"},
+      "headers": {
+        "accept": "*/*",
+        "connection": "close",
+        "host": "203.0.113.10",
+        "user-agent": "Mozilla/5.0"
+      },
+      "method": "GET"
+    }
+  },
+  "network": {"bytes": 177, "community_id": "1:HL0iYZHtkKWecl0HBQsLeL+lIc8=", "transport": "tcp"},
+  "observer": {
+    "hostname": "example-sensor",
+    "id": "example-sensor",
+    "product": "Spip",
+    "type": "honeypot",
+    "vendor": "HoneyLabs",
+    "version": "dev"
+  },
+  "source": {"bytes": 99, "ip": "198.51.100.23", "port": 51234},
+  "url": {"domain": "203.0.113.10", "path": "/.env"},
+  "user_agent": {"original": "Mozilla/5.0"}
 }
 ```
 
-Note: the agent only emits fields it can derive from the connection payload and metadata. Downstream systems can enrich these records (geo, ASN, etc.) if desired.
+Downstream systems can enrich these records (geo, ASN and so on) if desired.
 
 ## Fingerprinting
 
-Spip can add passive fingerprinting fields to each connection record (ECS-compatible, no change to payload capture):
+Spip adds passive fingerprinting fields to each record without changing what it captures:
 
-- **Community ID** (`network.community_id`): v1 flow hash of the 5-tuple (source/dest IP and port, protocol). When traffic is redirected via iptables, Spip uses the **original destination** (before REDIRECT) so the hash matches what other tools (e.g. Zeek, Suricata) would compute for the same flow.
-- **TLS**: `tls.client.server_name` (SNI), `tls.client.supported_protocols` (ALPN list) and `tls.client.hash.ja4` (JA4 fingerprint), all read from the ClientHello.
-- **Raw ClientHello**: `tls.client.hello_hex` holds the handshake record exactly as it arrived, header included. Every fingerprint above is derived from these bytes and each one discards something: JA4 sorts the extension list, JA3 keeps its order, and neither keeps GREASE placement or the extension bodies. Keeping the record is what lets you check a fingerprint, recompute it after a bug, or compute a scheme that did not exist when the traffic was captured. A hello is a few hundred bytes; capture stops at 16 KiB per connection. Set `capture_client_hello = false` to turn it off.
-- **SSH**: `ssh.client.hash.hassh` (Hassh), when the payload starts with `SSH-2.0-` and contains a KEXINIT.
-- **HTTP** - From the request head: `http.request.hash.akin` (Akin). The token carries a presence map over a fixed list of headers and short codes for the rest, so the distance between two tokens is the number of headers the two clients differ by, and header order never changes it. Scanners that rotate their User-Agent keep one fingerprint, because neither the User-Agent value nor the request path is part of it.
-
-All of these are additive; existing behaviour (local log, Loom, payload hex, HTTP parsing) is unchanged.
-
-**References (for verification and attribution):**  
-Community ID: [Corelight Community ID spec](https://github.com/corelight/community-id-spec).  
-JA4: [FoxIO JA4](https://github.com/FoxIO-LLC/ja4).  
-Hassh: [Salesforce HASSH](https://github.com/salesforce/hassh).  
-Akin: [honeylabshq/akin](https://github.com/honeylabshq/akin).  
-TLS fingerprinting uses [github.com/psanford/tlsfingerprint](https://github.com/psanford/tlsfingerprint) (MIT).
+- `network.community_id`: Community ID v1 flow hash of the 5-tuple (source and destination IP and port, protocol). When traffic is redirected through iptables, Spip hashes the original destination from before the REDIRECT, so the value matches what other network monitoring computes for the same flow.
+- `tls.client.server_name` (SNI), `tls.client.supported_protocols` (the ALPN list the client offered), `tls.client.hash.ja4` and `tls.client.ja3`, all read from the ClientHello. TLS also adds `tls.client.version`, `tls.client.cipher` and, when the client presents a certificate, `tls.client.client_certificate.*`. These fields need `cert_path` and `key_path`. Without them a TLS handshake is recorded as raw payload. A TLS connection whose handshake fails is closed without a record.
+- `tls.client.hello_hex`: the ClientHello record exactly as it arrived, header included. Every fingerprint above is derived from these bytes and each one discards part of them, such as extension order, GREASE placement or extension bodies. Keeping the record lets you check a fingerprint, recompute it after a bug, or compute a scheme that did not exist when the traffic was captured. A hello is a few hundred bytes and capture stops at 16 KiB per connection. Set `capture_client_hello = false` to turn it off.
+- `ssh.client.hash.hassh`: when the payload starts with `SSH-2.0-` and contains a KEXINIT.
+- `http.request.hash.akin`: an [Akin](https://github.com/honeylabshq/akin) token computed from the request head. The token carries a presence map over a fixed list of headers and short codes for the rest, so the distance between two tokens is the number of headers the two clients differ by, and header order never changes it. Scanners that rotate their User-Agent keep one fingerprint, because neither the User-Agent value nor the request path is part of it.
 
 ## UDP capture (DNS and QUIC)
 
@@ -132,73 +176,84 @@ Off by default. With `udp_enabled = true` Spip also listens for UDP on the same 
 
 Each datagram is classified in this order:
 
-- QUIC. A client's Initial packets are decrypted with the public Initial keys (RFC 9001 section 5.2; versions 1, 2 and draft-29). CRYPTO frames are reassembled by offset, which handles Chromium's scrambled frame order and ClientHellos split across datagrams by post-quantum key shares. Retransmissions are folded in, so one connection attempt is one record. The ClientHello yields the same `tls.client.*` fields as TCP, with a JA4 that starts with `q`. `quic.client.transport_parameters.hash` fingerprints the QUIC implementation from its transport parameters. Values that change per connection are left out, including the GREASE version Chromium inserts at random. In testing it separated curl (ngtcp2), Chromium and quic-go while staying stable across connections from each. Unknown versions padded to 1200 bytes are recorded as version probes. An attempt whose ClientHello never completes is recorded after three seconds with the bytes that arrived.
-- DNS. Queries and unsolicited responses (backscatter from someone spoofing the sensor's address) are decoded into the ECS `dns.*` fields, with EDNS details under `dns.edns`. `event.summary` reads like `DNS query TXT/CH version.bind`.
+- QUIC. A client's Initial packets are decrypted with the public Initial keys (RFC 9001 section 5.2; versions 1, 2 and draft-29). CRYPTO frames are reassembled by offset, which handles clients that send frames out of order and ClientHellos split across datagrams by post-quantum key shares. Retransmissions are folded in, so one connection attempt is one record. The ClientHello yields the same `tls.client.*` fields as TCP, and `tls.client.hash.ja4` starts with `q`. `quic.client.transport_parameters.hash` fingerprints the QUIC implementation from its transport parameters. Values that change per connection are left out, including randomly inserted GREASE versions, so the hash stays stable across connections from one client while telling different QUIC stacks apart. Unknown versions in datagrams padded to 1200 bytes are recorded as version probes. An attempt whose ClientHello never completes is recorded after three seconds with the bytes that arrived.
+- DNS. A datagram counts as DNS only when it frames as exactly one message with at least one valid question, allowing up to 4 bytes of zero, CR or LF padding (counted in `dns.trailing_bytes`). Queries and unsolicited responses (backscatter from someone spoofing the sensor's address) are decoded into the ECS `dns.*` fields, with EDNS details under `dns.edns`. `event.summary` reads like `DNS query TXT/CH version.bind`.
+- NetBIOS name service. It shares the DNS wire format but names NetBIOS names, so it is recorded as `network.protocol: netbios` with a summary such as `NetBIOS name query WORKGROUP<00>` and no `dns.*` fields.
 - Anything else is kept as raw UDP with its payload, as TCP probes are.
 
 Every UDP record carries `network.transport: udp` and a Community ID over protocol 17. UDP source addresses are not authenticated. A UDP record says what was sent, but not reliably who sent it, so it must not feed address reputation or blocklists the way TCP records do.
 
 ### Host setup
 
-A plain nat `REDIRECT`, the way the TCP side works, is not enough for UDP on its own. The kernel rewrites the destination before the socket sees it, and UDP has no `SO_ORIGINAL_DST`, so every event would carry Spip's own port. This was measured in a lab namespace: a datagram to port 53 arrived reporting port 7999.
+A plain nat `REDIRECT`, the way the TCP side works, is not enough for UDP on its own. The kernel rewrites the destination before the socket sees it, and UDP has no `SO_ORIGINAL_DST`, so every event would carry Spip's own port.
 
 Spip supports two ways around that, and the capture script picks one automatically:
 
-- **TPROXY** (mangle table), used wherever the kernel has the target. The datagram reaches Spip's transparent socket unchanged and the socket reads the real destination. Needs `CAP_NET_ADMIN`; Spip runs as root on the sensors.
-- **REDIRECT with a conntrack lookup** (nat table), for kernels without a working TPROXY. Spip asks conntrack over netlink for the flow whose reply direction matches the datagram it received, and takes the original destination from that entry. Needs read access to ctnetlink. The lookup runs only after the drop list and rate limits have admitted a datagram, and pauses for 30 seconds after three failed lookups in a row, so a flood or a stuck netlink socket cannot stall the reader. In the lab both modes recorded identical destination ports for IPv4 and IPv6.
+- TPROXY (mangle table), used wherever the kernel supports it. The datagram reaches Spip's transparent socket unchanged and the socket reads the real destination. The transparent socket needs `CAP_NET_ADMIN`.
+- REDIRECT with a conntrack lookup (nat table), for kernels without a working TPROXY. Spip asks conntrack over netlink for the flow whose reply direction matches the datagram it received, and takes the original destination from that entry. The netlink lookup also needs `CAP_NET_ADMIN`. It runs only after the drop list and rate limits have admitted a datagram, and pauses for 30 seconds after three failed lookups in a row, so a flood or a stuck netlink socket cannot stall the reader.
 
-The script picks REDIRECT inside an OpenVZ or Virtuozzo container and wherever the kernel refuses a TPROXY rule. Accepting the rule does not prove TPROXY delivers: an OpenVZ container accepts it and then passes nothing through. On other platforms, look at the first datagrams after `up`, and pin `MODE=redirect` if the TPROXY rule counts packets that never reach Spip.
+The script picks REDIRECT inside containers that share the host kernel through `/proc/vz`, and wherever the kernel refuses a TPROXY rule. Accepting the rule does not prove TPROXY delivers: such a container accepts it and then passes nothing through. On other platforms, look at the first datagrams after `up`, and pin `MODE=redirect` if the TPROXY rule counts packets that never reach Spip.
 
-`scripts/udp-capture.sh` installs the rule. Run `print` first to see exactly what it will do:
+`scripts/udp-capture.sh` installs the rules and needs root. Run `print` first to see exactly what it will do:
 
 ```bash
-PORT=8080 ./scripts/udp-capture.sh print
-PORT=8080 ./scripts/udp-capture.sh up      # idempotent; MODE=tproxy or MODE=redirect to force one
-./scripts/udp-capture.sh down
+sudo PORT=8080 ./scripts/udp-capture.sh print
+sudo PORT=8080 ./scripts/udp-capture.sh up      # idempotent; MODE=tproxy or MODE=redirect to force one
+sudo ./scripts/udp-capture.sh down
 ```
 
-The script leaves alone everything the host needs. It skips loopback, so local resolvers such as systemd-resolved on 127.0.0.53 keep working. It skips replies to the host's own traffic (conntrack ESTABLISHED under TPROXY; under REDIRECT the nat table only sees new flows), broadcast and multicast, and every port with a non-loopback UDP listener at install time, read from `/proc/net/udp*`, such as WireGuard, Tailscale and DHCP. Pass `EXEMPT="..."` for more. It adds no fwmark or routing table, because the honeypot addresses are already local. The usual TPROXY recipe with a mark and a local routing table fails on hosts with `src_valid_mark=1`, which WireGuard tooling sets: reverse-path filtering then drops every packet as martian.
+The script leaves alone everything the host needs. It skips loopback, so local resolvers on 127.0.0.53 keep working. It skips replies to the host's own traffic (conntrack ESTABLISHED under TPROXY; under REDIRECT the nat table only sees new flows), broadcast and multicast, and every port with a non-loopback UDP listener at install time, read from `/proc/net/udp*`, such as a VPN endpoint or a DHCP client. Pass `EXEMPT="..."` for more. It adds no fwmark or routing table, because the honeypot addresses are already local. The usual TPROXY recipe with a mark and a local routing table fails on hosts with `src_valid_mark=1`, which some VPN tooling sets: reverse-path filtering then drops every packet as martian.
 
 Every input is treated as hostile. A global limit (`udp_rate_limit_per_second`, default 50, `udp_rate_limit_burst`, default 500) sits behind a per-source limit (`udp_source_rate_limit_per_second`, default 5, `udp_source_rate_limit_burst`, default 20) keyed by IPv4 address or IPv6 /64, so one sender cannot spend the whole budget. At most 2 KB of each datagram is stored, while `source.bytes` keeps its real size. Pending QUIC attempts are capped at 1024 of 8 KB each. Attacker-supplied text (DNS names, ALPN values, close reasons) is escaped to printable ASCII. Drops, limits, kernel receive-buffer overflows (`SO_RXQ_OVFL`) and folded QUIC retransmissions are reported hourly and at shutdown.
 
 ## Loom (optional log shipping)
 
-Part of [log output](#log-output): when `[loom]` has `enabled = true`, the same ECS records are also batched and POSTed to your Loom ingest URL. Required when enabled: `url`, `sensor_id`, `token`. Optional: `batch_size` (default 50), `flush_interval` (e.g. `"10s"`), `insecure_skip_verify` (for self-signed Loom certs). The exporter runs asynchronously and does not block the capture loop; failed POSTs are logged to stderr and the batch is dropped (fail-open).
+When `[loom]` has `enabled = true`, the same ECS records are also batched and POSTed as a JSON array to the Loom ingest URL, with `Authorization: Bearer <token>` and `X-Spip-ID: <sensor_id>` headers. Required when enabled: `url`, `sensor_id`, `token`. Optional: `batch_size` (default 50), `flush_interval` (default `"10s"`), `insecure_skip_verify` (for self-signed Loom certificates).
+
+```toml
+[loom]
+enabled = true
+url = "https://loom.example.com/api/v1/ingest"
+sensor_id = "spip-agent"
+token = "..."
+```
+
+The exporter runs asynchronously and never blocks capture. A batch is retried up to three times: transport errors and 5xx responses after 1 and 2 seconds, a 429 after its `Retry-After` (at most 10 seconds). A 413 splits the batch in half and sends each part. Other 4xx responses drop the batch at once, since a bad token cannot succeed on retry. When the queue to the exporter is full, records skip Loom but stay in the local output, and a warning is logged at most once a minute. Errors are printed to stderr.
 
 ## Project Structure
-```
-.
-├── cmd/                 # Main application entry point
-├── internal/            # Config, logging, network, TLS, fingerprinting, exporters (e.g. Loom),
-│                        # udp (capture), quic (Initial decryption), dnsinfo (DNS decoding)
-├── pkg/                 # Linux socket helpers (SO_ORIGINAL_DST, transparent UDP)
-├── test/                # End-to-end test helpers
-└── scripts/             # Utility scripts (including `initial_setup.sh`)
-```
+
+- `cmd/spip-agent`: main application entry point
+- `internal/`: config, logging (ECS records), network (TCP handler and responders), tls, fingerprint, udp, quic (Initial decryption), dnsinfo (DNS decoding), sanitize, exporters/loom
+- `pkg/socket`: Linux socket helpers (original destination, transparent UDP)
+- `pkg/conntrack`: conntrack lookups over netlink
+- `test/e2e`: end-to-end tests
+- `scripts/`: setup, UDP capture and test scripts
 
 ## Testing
 Run unit tests with:
 ```bash
 go test ./...
 ```
+`make test` runs the same unit tests, and `make vet`, `make fmt` and `make check-fmt` cover the usual checks.
 
-**End-to-end tests** require privileges to manipulate `iptables`. Run them via the script (from the repo root):
+End-to-end tests require privileges to manipulate `iptables`. Run them via the script (from the repo root):
 ```bash
 sudo -E ./scripts/run_e2e_tests.sh
 ```
-The script sets up the environment and iptables. Alternatively use the container helper: `./scripts/run_e2e_in_container.sh`. E2E validates core behaviour (payload capture, source/destination, TLS detection, Loom batching, fingerprinting).
+The script builds the agent, flushes the nat table before and after the run, and accepts a test name to run a single test. Alternatively use the container helper, which needs Docker: `./scripts/run_e2e_in_container.sh`. E2E validates core behaviour (payload capture, source and original destination, TLS detection, Loom batching, fingerprinting).
 
 ## Notes on HTTP parsing and deployment
 
-Spip performs best-effort HTTP request detection from the captured payload. When the payload clearly resembles an HTTP request (valid request line plus basic headers or ALPN), the agent emits `http.*`, `url.path`, and `user_agent.original` fields. When it does not, Spip falls back to storing the payload in `event.summary` and always preserves the raw payload hex in `event.original_payload_hex`.
+Spip performs best-effort HTTP request detection from the captured payload. A payload counts as an HTTP request when its first line is a request line (GET, POST, PUT, DELETE, HEAD, OPTIONS or PATCH, a path, HTTP/1.0 or HTTP/1.1) and it also has a blank line ending the head or a Host header. The agent then emits `http.*`, `url.*` and `user_agent.original` fields. Otherwise Spip stores the payload in `event.summary`. The raw payload hex in `event.original_payload_hex` is always kept.
 
-Because Spip reflects the source IP in its responses and accepts arbitrary inbound TCP traffic, it is intended for use as a honeypot-style sensor or edge collector in controlled/monitored environments, not on arbitrary user endpoints.
+Because Spip reflects the source IP in its responses and accepts arbitrary inbound TCP traffic, it is intended for use as a honeypot-style sensor or edge collector in controlled and monitored environments, not on arbitrary user endpoints.
+
 ## Initial setup helper
-Run the interactive helper from the repo root (requires root when applying iptables rules):
+Run the interactive helper from the repo root as root:
 ```bash
 sudo ./scripts/initial_setup.sh
 ```
-The script prompts for: a short `name` (written into `config.toml`, used in logs as `observer.hostname` / `host.name`), listen IP and port, optional self-signed TLS cert generation (paths are written relative to the config so they work from any directory), optional Loom configuration (URL, sensor_id, token, batch_size, flush_interval, TLS verify), log file path, and optional iptables PREROUTING redirect.
+The script prompts for: a short `name` (used in logs as `observer.hostname` and `host.name`), listen IP and port, the SSH port to exclude from the redirect, optional self-signed TLS certificate generation with `openssl` (paths are written relative to the config so they work from any directory), log file path, optional Loom configuration (URL, sensor_id, token, batch_size, flush_interval, TLS verification), optional timeouts and rate limits, and the optional iptables PREROUTING redirect. It writes `config.toml` in the repo root, replacing any existing one. Before changing iptables it saves the nat table to `/tmp/spip-iptables-nat-backup-<timestamp>.rules` and then flushes it. It does not configure UDP capture or `ignore_sources`.
 
 ## License
 
