@@ -39,7 +39,8 @@ type LogMessage struct {
 type ConnectionData struct {
 	// Name of the agent that produced this record (optional)
 	Name               string        `json:"name,omitempty"`
-	Timestamp          int64         `json:"timestamp"`
+	Timestamp          int64         `json:"timestamp"`              // unix seconds
+	TimestampMs        int64         `json:"timestamp_ms,omitempty"` // the same instant in unix milliseconds
 	Payload            string        `json:"payload"`
 	PayloadHex         string        `json:"payload_hex"`
 	SourceIP           string        `json:"source_ip"`
@@ -122,7 +123,20 @@ type FileLogger struct {
 // reported in observer.version and agent.version.
 var Version = "dev"
 
-var httpReqLineRe = regexp.MustCompile(`^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+(\S+)\s+(HTTP/1\.[01])$`)
+// ECSVersion is the ECS schema version the documents follow, written to
+// ecs.version on every document.
+const ECSVersion = "8.11.0"
+
+// httpReqLineRe matches an HTTP request line: any RFC 9110 token as the
+// method (CONNECT, PROPFIND, M-SEARCH, lowercase methods), a request target
+// and an HTTP/<digit>.<digit> version.
+var httpReqLineRe = regexp.MustCompile("^([!#$%&'*+\\-.^_`|~0-9A-Za-z]+)\\s+(\\S+)\\s+(HTTP/[0-9]\\.[0-9])$")
+
+// legacyHTTPReqLineRe is the request line accepted before any token method
+// was: seven methods, HTTP/1.0 or HTTP/1.1. A request only httpReqLineRe
+// accepts still carries event.summary, as it did when it was not parsed, so
+// consumers that read the summary see the same value for the same input.
+var legacyHTTPReqLineRe = regexp.MustCompile(`^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+(\S+)\s+(HTTP/1\.[01])$`)
 
 func NewLogger(output io.Writer) Logger {
 	return &FileLogger{output: output}
@@ -150,8 +164,15 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 	// Build an ECS-like record using only available data (no external lookups)
 	ecs := make(map[string]interface{})
 
-	// @timestamp in RFC3339 UTC
-	ecs["@timestamp"] = time.Unix(data.Timestamp, 0).UTC().Format(time.RFC3339Nano)
+	// @timestamp in RFC3339 UTC. Producers set TimestampMs from the same
+	// time.Time as Timestamp; the fraction is used only when the two agree on
+	// the second, so the second never differs from Timestamp.
+	ts := time.Unix(data.Timestamp, 0)
+	if data.TimestampMs != 0 && data.TimestampMs/1000 == data.Timestamp {
+		ts = time.UnixMilli(data.TimestampMs)
+	}
+	ecs["@timestamp"] = ts.UTC().Format(time.RFC3339Nano)
+	ecs["ecs"] = map[string]interface{}{"version": ECSVersion}
 
 	transport := data.Transport
 	if transport == "" {
@@ -299,11 +320,17 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 			if m := httpReqLineRe.FindStringSubmatch(reqLine); m != nil {
 				method := m[1]
 				path := m[2]
+				version := strings.TrimPrefix(m[3], "HTTP/")
 
 				// Check for header terminator or Host header presence
 				hasTerminator := strings.Contains(payload, "\r\n\r\n")
 				hasHost := false
+				// headers keeps every value of a repeated header, joined
+				// with ", " in arrival order. last keeps the final value,
+				// which is what url.domain and user_agent.original are
+				// derived from.
 				headers := map[string]string{}
+				last := map[string]string{}
 				bodyStartIndex := -1
 
 				// Walk lines after request-line to collect headers until blank line
@@ -325,7 +352,13 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 						name := strings.TrimSpace(ln[:idx])
 						value := strings.TrimSpace(ln[idx+1:])
 						if name != "" {
-							headers[strings.ToLower(name)] = value
+							key := strings.ToLower(name)
+							if prev, seen := headers[key]; seen {
+								headers[key] = prev + ", " + value
+							} else {
+								headers[key] = value
+							}
+							last[key] = value
 						}
 					}
 				}
@@ -353,10 +386,11 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 						reqObj["hash"] = map[string]interface{}{"akin": fp}
 					}
 					httpObj["request"] = reqObj
+					httpObj["version"] = version
 
 					// Build url.* from path and Host header when available
 					urlObj := map[string]interface{}{"path": path}
-					if hostHeader, ok := headers["host"]; ok && hostHeader != "" {
+					if hostHeader, ok := last["host"]; ok && hostHeader != "" {
 						// Split host:port if present
 						host := hostHeader
 						var portVal int
@@ -380,7 +414,7 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 					ecs["url"] = urlObj
 
 					// Extract User-Agent if present (prefer parsed header)
-					if ua, ok := headers["user-agent"]; ok && ua != "" {
+					if ua, ok := last["user-agent"]; ok && ua != "" {
 						ecs["user_agent"] = map[string]interface{}{"original": ua}
 					}
 
@@ -396,6 +430,12 @@ func (l *FileLogger) LogConnection(data *ConnectionData) error {
 					}
 
 					ecs["http"] = httpObj
+
+					if !legacyHTTPReqLineRe.MatchString(reqLine) {
+						if ev, ok := ecs["event"].(map[string]interface{}); ok {
+							ev["summary"] = data.Payload
+						}
+					}
 				} else {
 					// Looks like a request-line but missing headers/terminator => don't
 					// classify as HTTP. Preserve payload in event.summary (keeping the

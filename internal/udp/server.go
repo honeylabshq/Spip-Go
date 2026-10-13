@@ -425,6 +425,7 @@ func (s *Server) base(payload []byte, src *net.UDPAddr, dst *socket.OriginalDst,
 	return &logging.ConnectionData{
 		Name:            s.opt.Name,
 		Timestamp:       ts.Unix(),
+		TimestampMs:     ts.UnixMilli(),
 		PayloadHex:      hex.EncodeToString(payload[:min(len(payload), MaxStoredPayload)]),
 		SourceIP:        srcIP,
 		SourcePort:      uint16(src.Port),

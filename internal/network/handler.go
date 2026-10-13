@@ -403,9 +403,11 @@ func (h *Handler) HandleConnection(conn *net.TCPConn) {
 		if fingerprint.IsSSHClientPayload(payloadBytes) {
 			sshHassh = fingerprint.Hassh(payloadBytes)
 		}
+		now := time.Now()
 		connData := &logging.ConnectionData{
 			Name:                  h.name,
-			Timestamp:             time.Now().Unix(),
+			Timestamp:             now.Unix(),
+			TimestampMs:           now.UnixMilli(),
 			Payload:               string(payloadBytes),
 			PayloadHex:            hex.EncodeToString(payloadBytes),
 			SourceIP:              remoteAddr.IP.String(),

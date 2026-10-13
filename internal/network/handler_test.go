@@ -150,6 +150,9 @@ func TestHandleConnection(t *testing.T) {
 	if conn.IsTLS {
 		t.Error("Expected non-TLS connection")
 	}
+	if conn.TimestampMs == 0 || conn.TimestampMs/1000 != conn.Timestamp {
+		t.Errorf("TimestampMs %d is not the same instant as Timestamp %d", conn.TimestampMs, conn.Timestamp)
+	}
 	if len(mock.errors) > 0 {
 		t.Errorf("Unexpected errors: %v", mock.errors)
 	}

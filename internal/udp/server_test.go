@@ -284,3 +284,38 @@ func TestNetBIOSIsNotRecordedAsDNS(t *testing.T) {
 		t.Errorf("summary %v", get(m, "event.summary"))
 	}
 }
+
+// The record's @timestamp keeps the milliseconds of the time the datagram
+// was taken in, within the same second as before.
+func TestRecordTimestampHasMilliseconds(t *testing.T) {
+	r := newRig(t, Options{})
+	r.now = time.Unix(1_800_000_000, 250_000_000)
+	r.send([]byte("\xff\xff\xff\xffgetstatus\n"), 40001, 27960)
+	if got := get(r.records()[0], "@timestamp"); got != "2027-01-15T08:00:00.25Z" {
+		t.Errorf("@timestamp = %v", got)
+	}
+}
+
+// An SSDP search is an HTTP request over UDP. It is parsed like one and keeps
+// the event.summary it carried before its method was recognised.
+func TestSSDPSearchIsParsedAsHTTP(t *testing.T) {
+	r := newRig(t, Options{})
+	msg := "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: ssdp:all\r\n\r\n"
+	r.send([]byte(msg), 40002, 1900)
+	m := r.records()[0]
+	checks := map[string]any{
+		"http.request.method":     "M-SEARCH",
+		"http.version":            "1.1",
+		"url.path":                "*",
+		"url.domain":              "239.255.255.250",
+		"url.port":                float64(1900),
+		"http.request.headers.st": "ssdp:all",
+		"event.summary":           msg,
+		"network.transport":       "udp",
+	}
+	for path, want := range checks {
+		if got := get(m, path); got != want {
+			t.Errorf("%s = %v, want %v", path, got, want)
+		}
+	}
+}
