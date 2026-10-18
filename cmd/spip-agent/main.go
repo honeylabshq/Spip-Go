@@ -69,7 +69,7 @@ func main() {
 
 	fmt.Fprintln(os.Stderr, "Starting Spip agent...")
 	if cfg.Loom.Enabled {
-		fmt.Fprintln(os.Stderr, "Loom enabled")
+		fmt.Fprintf(os.Stderr, "Loom enabled, spool %s\n", cfg.Loom.SpoolDir)
 	}
 
 	// Initialize TLS if configured

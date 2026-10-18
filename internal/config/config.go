@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,15 +13,33 @@ import (
 )
 
 type LoomConfig struct {
-	Enabled             bool   `toml:"enabled"`
-	URL                 string `toml:"url"`
-	SensorID            string `toml:"sensor_id"`
-	Token               string `toml:"token"`
-	BatchSize           int    `toml:"batch_size"`
-	FlushInterval       string `toml:"flush_interval"`
-	InsecureSkipVerify  bool   `toml:"insecure_skip_verify"`
+	Enabled            bool   `toml:"enabled"`
+	URL                string `toml:"url"`
+	SensorID           string `toml:"sensor_id"`
+	Token              string `toml:"token"`
+	BatchSize          int    `toml:"batch_size"`
+	FlushInterval      string `toml:"flush_interval"`
+	InsecureSkipVerify bool   `toml:"insecure_skip_verify"`
+	// SpoolDir holds the batches waiting for Loom, so an ingest outage is
+	// replayed instead of lost. Relative paths resolve against the config
+	// file's directory; the default is loom-spool beside config.toml.
+	SpoolDir string `toml:"spool_dir,omitempty"`
+	// SpoolMaxSizeMB caps the spool (default 512); past it the oldest
+	// batches are removed. SpoolMaxAge removes batches older than this
+	// (default "7d"; Go durations such as "72h" or a whole number of days
+	// followed by "d").
+	SpoolMaxSizeMB      int    `toml:"spool_max_size_mb,omitempty"`
+	SpoolMaxAge         string `toml:"spool_max_age,omitempty"`
 	flushIntervalParsed time.Duration
+	spoolMaxAgeParsed   time.Duration
 }
+
+// Spool defaults: about 512 MB and a week, sized for a small VPS disk.
+const (
+	DefaultSpoolDirName = "loom-spool"
+	DefaultSpoolMaxMB   = 512
+	DefaultSpoolMaxAge  = 7 * 24 * time.Hour
+)
 
 type Config struct {
 	Name                string `toml:"name"`
@@ -126,6 +145,13 @@ func LoadConfig(path string) (*Config, error) {
 	if config.KeyPath != "" && !filepath.IsAbs(config.KeyPath) {
 		config.KeyPath = filepath.Join(configDir, config.KeyPath)
 	}
+	// The spool sits beside config.toml unless told otherwise: on the sensors
+	// that is the agent's working directory, which systemd runs it from.
+	if config.Loom.SpoolDir == "" {
+		config.Loom.SpoolDir = filepath.Join(configDir, DefaultSpoolDirName)
+	} else if !filepath.IsAbs(config.Loom.SpoolDir) {
+		config.Loom.SpoolDir = filepath.Join(configDir, config.Loom.SpoolDir)
+	}
 
 	nets, err := parseIgnoreSources(config.IgnoreSources)
 	if err != nil {
@@ -160,6 +186,38 @@ func (c *Config) IsTLSEnabled() bool {
 }
 
 func (l *LoomConfig) FlushIntervalDuration() time.Duration { return l.flushIntervalParsed }
+
+// SpoolMaxAgeDuration is the age past which a spooled batch is removed.
+func (l *LoomConfig) SpoolMaxAgeDuration() time.Duration {
+	if l.spoolMaxAgeParsed <= 0 {
+		return DefaultSpoolMaxAge
+	}
+	return l.spoolMaxAgeParsed
+}
+
+// SpoolMaxBytes is the spool's size cap in bytes.
+func (l *LoomConfig) SpoolMaxBytes() int64 {
+	if l.SpoolMaxSizeMB <= 0 {
+		return DefaultSpoolMaxMB << 20
+	}
+	return int64(l.SpoolMaxSizeMB) << 20
+}
+
+// parseAge reads a Go duration or a whole number of days ("7d").
+func parseAge(v string) (time.Duration, error) {
+	if days, ok := strings.CutSuffix(v, "d"); ok {
+		n, err := strconv.Atoi(days)
+		if err != nil || n <= 0 {
+			return 0, fmt.Errorf("invalid day count %q", v)
+		}
+		return time.Duration(n) * 24 * time.Hour, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("invalid duration %q", v)
+	}
+	return d, nil
+}
 
 func (c *Config) Validate() error {
 	if c.Name == "" {
@@ -204,6 +262,19 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("loom.flush_interval must be a positive duration (e.g. 10s)")
 		}
 		c.Loom.flushIntervalParsed = parsed
+		if c.Loom.SpoolMaxSizeMB < 0 {
+			return fmt.Errorf("loom.spool_max_size_mb must not be negative")
+		}
+		if c.Loom.SpoolMaxAge != "" {
+			age, err := parseAge(c.Loom.SpoolMaxAge)
+			if err != nil {
+				return fmt.Errorf("loom.spool_max_age must be a positive duration (e.g. 168h or 7d)")
+			}
+			c.Loom.spoolMaxAgeParsed = age
+		}
+		if c.Loom.SpoolDir == "" {
+			c.Loom.SpoolDir = DefaultSpoolDirName
+		}
 	}
 	return nil
 }

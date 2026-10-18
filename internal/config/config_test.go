@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLoadConfig(t *testing.T) {
@@ -214,5 +215,61 @@ func TestUDPDefaults(t *testing.T) {
 	c.UDPPort = 9000
 	if c.UDPListenPort() != 9000 {
 		t.Errorf("explicit udp_port ignored")
+	}
+}
+
+// A sensor config written before the spool existed gets one beside
+// config.toml with the default caps, so no deployed config needs editing.
+func TestLoomSpoolDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := "name = \"s\"\nip = \"0.0.0.0\"\nport = 8080\n[loom]\nenabled = true\nurl = \"https://loom.local/ingest\"\nsensor_id = \"s\"\ntoken = \"t\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(dir, "loom-spool"); cfg.Loom.SpoolDir != want {
+		t.Errorf("SpoolDir = %q, want %q", cfg.Loom.SpoolDir, want)
+	}
+	if got := cfg.Loom.SpoolMaxBytes(); got != 512<<20 {
+		t.Errorf("SpoolMaxBytes = %d", got)
+	}
+	if got := cfg.Loom.SpoolMaxAgeDuration(); got != 7*24*time.Hour {
+		t.Errorf("SpoolMaxAge = %v", got)
+	}
+}
+
+func TestLoomSpoolOverrides(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	body := "name = \"s\"\nip = \"0.0.0.0\"\nport = 8080\n[loom]\nenabled = true\nurl = \"https://loom.local/ingest\"\nsensor_id = \"s\"\ntoken = \"t\"\nspool_dir = \"var/spool\"\nspool_max_size_mb = 64\nspool_max_age = \"2d\"\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(dir, "var", "spool"); cfg.Loom.SpoolDir != want {
+		t.Errorf("SpoolDir = %q, want %q", cfg.Loom.SpoolDir, want)
+	}
+	if got := cfg.Loom.SpoolMaxBytes(); got != 64<<20 {
+		t.Errorf("SpoolMaxBytes = %d", got)
+	}
+	if got := cfg.Loom.SpoolMaxAgeDuration(); got != 48*time.Hour {
+		t.Errorf("SpoolMaxAge = %v", got)
+	}
+	cfg.Loom.SpoolMaxAge = "soon"
+	if err := cfg.Validate(); err == nil {
+		t.Error("an unparsable spool_max_age must be refused")
 	}
 }

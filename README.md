@@ -63,7 +63,7 @@ The first command flushes the whole nat table. Leave it out on a host that has N
 ```bash
 ./spip-agent -config config.toml
 ```
-`-config` is the only flag and defaults to `config.toml` in the working directory. SIGINT or SIGTERM stops the listener, waits up to 15 seconds for open connections and flushes any pending Loom batch.
+`-config` is the only flag and defaults to `config.toml` in the working directory. SIGINT or SIGTERM stops the listener, waits up to 15 seconds for open connections and writes any pending Loom batch to the spool, giving it 5 seconds to send; the rest is sent at the next start.
 
 ## Responses
 
@@ -208,7 +208,7 @@ Every input is treated as hostile. A global limit (`udp_rate_limit_per_second`, 
 
 ## Loom (optional log shipping)
 
-When `[loom]` has `enabled = true`, the same ECS records are also batched and POSTed as a JSON array to the Loom ingest URL, with `Authorization: Bearer <token>` and `X-Spip-ID: <sensor_id>` headers. Required when enabled: `url`, `sensor_id`, `token`. Optional: `batch_size` (default 50), `flush_interval` (default `"10s"`), `insecure_skip_verify` (for self-signed Loom certificates).
+When `[loom]` has `enabled = true`, the same ECS records are also batched and POSTed as a JSON array to the Loom ingest URL, with `Authorization: Bearer <token>` and `X-Spip-ID: <sensor_id>` headers. Required when enabled: `url`, `sensor_id`, `token`. Optional: `batch_size` (default 50, at most 500), `flush_interval` (default `"10s"`), `insecure_skip_verify` (for self-signed Loom certificates), `spool_dir` (default `loom-spool` beside the config file; relative paths resolve against the config file's directory), `spool_max_size_mb` (default 512) and `spool_max_age` (default `"7d"`; a Go duration or a whole number of days).
 
 ```toml
 [loom]
@@ -218,7 +218,11 @@ sensor_id = "spip-agent"
 token = "..."
 ```
 
-The exporter runs asynchronously and never blocks capture. A batch is retried up to three times: transport errors and 5xx responses after 1 and 2 seconds, a 429 after its `Retry-After` (at most 10 seconds). A 413 splits the batch in half and sends each part. Other 4xx responses drop the batch at once, since a bad token cannot succeed on retry. When the queue to the exporter is full, records skip Loom but stay in the local output, and a warning is logged at most once a minute. Errors are printed to stderr.
+Every closed batch is first written to the spool directory, one file per batch holding the exact request body, through a synced temporary file and a rename so a crash never leaves a partial batch under a name that is replayed. A separate sender posts the oldest file and deletes it only after a 2xx, so a delivered batch is never sent again. After a failure it retries the same batch with a pause that doubles from 1 second to 1 minute, so an outage of hours is replayed when Loom answers again, and batches left by an earlier run are sent at the next start. Capture never waits on the network: the batcher only writes to disk, and only the spool's file index is kept in memory.
+
+Responses: a 413 halves the batch in the spool until each part fits Loom's `max_body_size_bytes`, and a single record Loom still refuses is dropped and logged. A 429 is retried after its `Retry-After` (at most 10 seconds). 400 and 415 drop the batch, since a malformed body cannot succeed on retry. Everything else (5xx, transport errors, 401 and 403) is kept and retried, so fixing a token on either side delivers what waited.
+
+The spool removes batches unsent only past its limits, always the oldest first: the size cap, the age cap, and 128 MB of free disk space it always leaves on the filesystem. When even an emptied spool cannot leave that much free, batches wait in a memory queue of at most 8 MB instead, which is also used when no spool directory can be created (a fallback under the system temp directory is tried first). Every removal is counted and logged on its first occurrence and then at most once an hour. If the queue to the exporter is ever full, records skip Loom but stay in the local output, and a warning is logged at most once a minute. Shipping messages are printed to stderr.
 
 ## Project Structure
 

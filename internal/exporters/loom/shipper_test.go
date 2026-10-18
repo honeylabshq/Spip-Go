@@ -49,6 +49,7 @@ func TestShipperBatchesAndFlushes(t *testing.T) {
 			Token:         "test-token",
 			BatchSize:     2,
 			FlushInterval: "100ms",
+			SpoolDir:      t.TempDir(),
 		},
 	}
 	if err := fullCfg.Validate(); err != nil {
