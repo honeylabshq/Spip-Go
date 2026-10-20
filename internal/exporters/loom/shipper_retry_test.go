@@ -229,9 +229,14 @@ func TestHungLoomNeverBlocksTheChannel(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
-	defer close(release)
 	s, ch, _ := newTestShipper(t, srv.URL, "", 50)
 	s.client.Timeout = time.Hour
+	// Release Loom and stop the shipper before the spool's temp dir is
+	// removed, or the flush that follows the release races the cleanup.
+	defer func() {
+		close(release)
+		s.Shutdown()
+	}()
 
 	start := time.Now()
 	for i := 0; i < 5000; i++ {
