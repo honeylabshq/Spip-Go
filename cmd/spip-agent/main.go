@@ -25,6 +25,7 @@ var version = "dev"
 
 func main() {
 	logging.Version = version
+	loom.Version = version
 	// Parse command line flags
 	configPath := flag.String("config", "config.toml", "Path to configuration file")
 	flag.Parse()

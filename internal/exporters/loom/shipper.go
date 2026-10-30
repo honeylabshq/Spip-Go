@@ -65,6 +65,15 @@ const (
 	memQueueMax    = 8 << 20   // fallback when the spool cannot be written
 )
 
+// Version is the agent's build version, sent to Loom as X-Sensor-Version on
+// every batch request so the operator can see which build each sensor runs.
+// It travels with the request only: the records themselves are unchanged.
+// Empty sends no header, which Loom accepts as before.
+var Version string
+
+// versionHeader is the request header Loom records per sensor.
+const versionHeader = "X-Sensor-Version"
+
 // fallbackSpoolDir is tried when the configured spool directory cannot be
 // used.
 var fallbackSpoolDir = filepath.Join(os.TempDir(), "spip-loom-spool")
@@ -386,6 +395,9 @@ func (s *Shipper) post(ctx context.Context, body []byte) (int, time.Duration, er
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Spip-ID", s.cfg.SensorID)
 	req.Header.Set("Authorization", "Bearer "+s.cfg.Token)
+	if Version != "" {
+		req.Header.Set(versionHeader, Version)
+	}
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return 0, 0, err
