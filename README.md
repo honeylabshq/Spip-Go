@@ -208,7 +208,7 @@ Every input is treated as hostile. A global limit (`udp_rate_limit_per_second`, 
 
 ## Loom (optional log shipping)
 
-When `[loom]` has `enabled = true`, the same ECS records are also batched and POSTed as a JSON array to the Loom ingest URL, with `Authorization: Bearer <token>` and `X-Spip-ID: <sensor_id>` headers. Required when enabled: `url`, `sensor_id`, `token`. Optional: `batch_size` (default 50, at most 500), `flush_interval` (default `"10s"`), `insecure_skip_verify` (for self-signed Loom certificates), `spool_dir` (default `loom-spool` beside the config file; relative paths resolve against the config file's directory), `spool_max_size_mb` (default 512) and `spool_max_age` (default `"7d"`; a Go duration or a whole number of days).
+When `[loom]` has `enabled = true`, the same ECS records are also batched and POSTed as a JSON array to the Loom ingest URL, with `Authorization: Bearer <token>`, `X-Spip-ID: <sensor_id>` and `X-Sensor-Version: <the build version>` headers. The version header lets Loom record which build each sensor runs; it is not added to the records. Required when enabled: `url`, `sensor_id`, `token`. Optional: `batch_size` (default 50, at most 500), `flush_interval` (default `"10s"`), `insecure_skip_verify` (for self-signed Loom certificates), `spool_dir` (default `loom-spool` beside the config file; relative paths resolve against the config file's directory), `spool_max_size_mb` (default 512) and `spool_max_age` (default `"7d"`; a Go duration or a whole number of days).
 
 ```toml
 [loom]
