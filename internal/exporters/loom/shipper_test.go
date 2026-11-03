@@ -14,6 +14,7 @@ import (
 func TestShipperBatchesAndFlushes(t *testing.T) {
 	var received [][]map[string]interface{}
 	var mu sync.Mutex
+	got := make(chan struct{}, 16)
 	srv := http.Server{
 		Addr: "127.0.0.1:0",
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -29,6 +30,7 @@ func TestShipperBatchesAndFlushes(t *testing.T) {
 			mu.Lock()
 			received = append(received, batch)
 			mu.Unlock()
+			got <- struct{}{}
 			w.WriteHeader(http.StatusOK)
 		}),
 	}
@@ -63,7 +65,13 @@ func TestShipperBatchesAndFlushes(t *testing.T) {
 
 	inCh <- map[string]interface{}{"event": "a"}
 	inCh <- map[string]interface{}{"event": "b"}
-	time.Sleep(150 * time.Millisecond)
+	// Wait for the server to receive a batch rather than for a fixed 150 ms:
+	// a busy CI runner missed the window and failed the dependency bump in
+	// PR #19 (2026-11-01) with "expected at least one batch, got 0".
+	select {
+	case <-got:
+	case <-time.After(5 * time.Second):
+	}
 
 	mu.Lock()
 	n := len(received)
