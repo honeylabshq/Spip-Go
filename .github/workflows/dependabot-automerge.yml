@@ -1,0 +1,153 @@
+# Dependabot patch and minor updates merge by themselves once CI is green,
+# with no model and no person in the path (owner, 2026-11-13: dependencies
+# must still be updated when the AI loops are off). Majors are never merged
+# here; they wait for a person.
+#
+# This repository has no branch protection with required checks (a private
+# repository on the free plan cannot have it), so `gh pr merge --auto` would
+# merge at once. Instead the merge follows the owner's rule "merge only on a
+# read green": it runs when the CI workflow completes, and merges only when
+#   - the pull request is Dependabot's, still open, and its head is the
+#     commit CI tested (the merge also passes --match-head-commit),
+#   - the label `automerge-ok` is on it, which the first job sets from
+#     dependabot/fetch-metadata for semver patch and minor updates only,
+#   - the newest CI run on that commit concluded success, and the
+#     newest run of every other check on it is success, skipped or neutral.
+# The first job also tries the merge, for the case where CI finished before
+# the label was set.
+#
+# A merge made with GITHUB_TOKEN starts no push workflow, so the job then
+# dispatches CI on main: the deployer ships only a main commit with
+# green CI.
+name: Dependabot auto-merge
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: dependabot-automerge-${{ github.event.pull_request.head.ref || github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  label:
+    name: dependabot automerge label
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+      checks: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      SHA: ${{ github.event.pull_request.head.sha }}
+      CI_FILE: ci.yml
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ github.token }}
+      - name: Label patch and minor updates, unlabel the rest
+        env:
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+        run: |
+          echo "update type: ${UPDATE_TYPE:-unknown}"
+          case "$UPDATE_TYPE" in
+            version-update:semver-patch|version-update:semver-minor)
+              gh label create automerge-ok -R "$REPO" --color 0e8a16 \
+                --description "Dependabot patch or minor update, merged once CI is green" --force
+              gh pr edit "$PR" -R "$REPO" --add-label automerge-ok ;;
+            *)
+              gh pr edit "$PR" -R "$REPO" --remove-label automerge-ok 2>/dev/null || true
+              echo "not a patch or minor update: left for a person" ;;
+          esac
+      - name: Merge when CI on this commit is already green
+        run: |
+          set -euo pipefail
+          info=$(gh pr view "$PR" -R "$REPO" --json state,headRefOid,author,labels \
+            --jq '[.state, .headRefOid, .author.login, ([.labels[].name] | index("automerge-ok") != null | tostring)] | join(" ")')
+          read -r state head author labelled <<<"$info"
+          if [ "$state" != OPEN ] || [ "$head" != "$SHA" ] || [ "$author" != app/dependabot ] || [ "$labelled" != true ]; then
+            echo "not merging #$PR: state $state, head $head (CI read $SHA), author $author, automerge-ok $labelled"
+            exit 0
+          fi
+          ci=$(gh api "repos/$REPO/actions/workflows/$CI_FILE/runs?head_sha=$SHA&event=pull_request&per_page=50" \
+            --jq '[.workflow_runs[]] | sort_by(.id) | last | if . == null then "none" else (.conclusion // .status) end')
+          if [ "$ci" != success ]; then
+            echo "not merging #$PR: the newest $CI_FILE run on $SHA is $ci"
+            exit 0
+          fi
+          bad=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
+            --jq '[.check_runs[] | select(.name | startswith("dependabot automerge") | not)] | group_by(.name) | map(max_by(.id))
+                  | map(select(.status != "completed" or ((.conclusion // "") | IN("success", "skipped", "neutral") | not)))
+                  | map(.name + " " + (.conclusion // .status)) | join(", ")')
+          if [ -n "$bad" ]; then
+            echo "not merging #$PR: not green on $SHA: $bad"
+            exit 0
+          fi
+          gh pr merge "$PR" -R "$REPO" --squash --match-head-commit "$SHA" --delete-branch
+          echo "merged #$PR ($SHA) on a green $CI_FILE run"
+          gh workflow run "$CI_FILE" -R "$REPO" --ref main
+          echo "dispatched $CI_FILE on main"
+
+  merge:
+    name: dependabot automerge merge
+    if: >-
+      github.event_name == 'workflow_run'
+      && github.event.workflow_run.event == 'pull_request'
+      && github.event.workflow_run.conclusion == 'success'
+      && startsWith(github.event.workflow_run.head_branch, 'dependabot/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+      checks: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      SHA: ${{ github.event.workflow_run.head_sha }}
+      BRANCH: ${{ github.event.workflow_run.head_branch }}
+      CI_FILE: ci.yml
+    steps:
+      - name: Merge on a read green
+        run: |
+          set -euo pipefail
+          PR=$(gh pr list -R "$REPO" --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          [ -n "$PR" ] || { echo "no open pull request for $BRANCH"; exit 0; }
+          info=$(gh pr view "$PR" -R "$REPO" --json state,headRefOid,author,labels \
+            --jq '[.state, .headRefOid, .author.login, ([.labels[].name] | index("automerge-ok") != null | tostring)] | join(" ")')
+          read -r state head author labelled <<<"$info"
+          if [ "$state" != OPEN ] || [ "$head" != "$SHA" ] || [ "$author" != app/dependabot ] || [ "$labelled" != true ]; then
+            echo "not merging #$PR: state $state, head $head (CI read $SHA), author $author, automerge-ok $labelled"
+            exit 0
+          fi
+          ci=$(gh api "repos/$REPO/actions/workflows/$CI_FILE/runs?head_sha=$SHA&event=pull_request&per_page=50" \
+            --jq '[.workflow_runs[]] | sort_by(.id) | last | if . == null then "none" else (.conclusion // .status) end')
+          if [ "$ci" != success ]; then
+            echo "not merging #$PR: the newest $CI_FILE run on $SHA is $ci"
+            exit 0
+          fi
+          bad=$(gh api "repos/$REPO/commits/$SHA/check-runs?per_page=100" \
+            --jq '[.check_runs[] | select(.name | startswith("dependabot automerge") | not)] | group_by(.name) | map(max_by(.id))
+                  | map(select(.status != "completed" or ((.conclusion // "") | IN("success", "skipped", "neutral") | not)))
+                  | map(.name + " " + (.conclusion // .status)) | join(", ")')
+          if [ -n "$bad" ]; then
+            echo "not merging #$PR: not green on $SHA: $bad"
+            exit 0
+          fi
+          gh pr merge "$PR" -R "$REPO" --squash --match-head-commit "$SHA" --delete-branch
+          echo "merged #$PR ($SHA) on a green $CI_FILE run"
+          gh workflow run "$CI_FILE" -R "$REPO" --ref main
+          echo "dispatched $CI_FILE on main"
