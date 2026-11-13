@@ -3,6 +3,9 @@ name: CI
 on:
   push:
   pull_request:
+  # The Dependabot auto-merge dispatches CI on main after a merge, since a
+  # merge made with GITHUB_TOKEN starts no push workflow.
+  workflow_dispatch:
 
 jobs:
   test:
