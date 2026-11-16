@@ -66,9 +66,9 @@ jobs:
             version-update:semver-patch|version-update:semver-minor)
               gh label create automerge-ok -R "$REPO" --color 0e8a16 \
                 --description "Dependabot patch or minor update, merged once CI is green" --force
-              gh pr edit "$PR" -R "$REPO" --add-label automerge-ok ;;
+              gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=automerge-ok" >/dev/null ;;
             *)
-              gh pr edit "$PR" -R "$REPO" --remove-label automerge-ok 2>/dev/null || true
+              gh api -X DELETE "repos/$REPO/issues/$PR/labels/automerge-ok" >/dev/null 2>&1 || true
               echo "not a patch or minor update: left for a person" ;;
           esac
       - name: Merge when CI on this commit is already green
