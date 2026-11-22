@@ -23,7 +23,7 @@ jobs:
         # said '1.24', and main went red with "go.mod requires go >= 1.25.0
         # (running go 1.24.13; GOTOOLCHAIN=local)". Two places holding one
         # version is what drifted; now there is one.
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
           cache: true
