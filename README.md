@@ -1,5 +1,7 @@
 # Spip - Network Honeypot Sensor
 
+Maintained by [HoneyLabs, honeypot threat intelligence](https://honeylabs.net).
+
 Spip is a low-interaction network honeypot sensor for Linux, written in Go. It accepts TCP connections on any port the host redirects to it, plain or TLS, answers just enough to make a client send its next message, and writes each exchange as one JSON record with ECS field names, ready for a SIEM or data lake. Optional UDP capture records datagrams and never answers them.
 
 HoneyLabs runs Spip to collect the data published on [honeylabs.net](https://honeylabs.net).
